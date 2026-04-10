@@ -1,1 +1,15 @@
-{"packages": {}}
+{
+  "packages": {
+    "hello": {
+      "description": "A hello world program for EYN-OS",
+      "versions": {
+        "1.0.0": {
+          "url": "http://192.168.122.251/releases/hello-1.0.0-i386.tar.gz",
+          "sha256": "fc711f2a46093d1809b4238ea8fc63a389f4184c100856b62f94e5cad84a9831",
+          "deps": []
+        }
+      },
+      "latest": "1.0.0"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+NAME="hello"
+VERSION="1.0.0"
+ARCH="i386"
+DESCRIPTION="A hello world program for EYN-OS"
+DEPS=()
+
+SOURCE_URL="https://example.com/hello-1.0.0.tar.gz"
