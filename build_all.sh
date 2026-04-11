@@ -216,6 +216,6 @@ scp ${RELEASES_DIR}/*.tar.gz ${SERVER_USER}@${SERVER_IP}:${SERVER_RELEASES}/
 echo "Pushing index..."
 git add index.json
 git commit -m "rebuild all packages ${VERSION}"
-git push server master
+git push server main
 
 echo "All done."
