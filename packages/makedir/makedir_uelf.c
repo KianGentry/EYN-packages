@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (mkdir(argv[1]) != 0) {
+    if (mkdir(argv[1], 0) != 0) {
         printf("makedir: failed to create directory: %s\n", argv[1]);
         return 1;
     }
