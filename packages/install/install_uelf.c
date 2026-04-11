@@ -1,11 +1,12 @@
 #include <stdio.h>
 #include <string.h>
+#include <dirent.h>
 
 #include <eynos_cmdmeta.h>
 
-#include "../../install/index.h"
-#include "../../install/package.h"
-#include "../../install/resolve.h"
+#include <install/index.h>
+#include <install/package.h>
+#include <install/resolve.h>
 
 EYN_CMDMETA_V1("Install packages from the EYN-OS package index.", "install hello");
 
@@ -64,11 +65,3 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-/*
- * build_user_c.sh compiles one translation unit per command source.
- * Include install module implementations directly to preserve modular files
- * under /install without changing the userland build pipeline.
- */
-#include "../../install/package.c"
-#include "../../install/index.c"
-#include "../../install/resolve.c"

@@ -4,8 +4,7 @@
 
 set -uo pipefail
 
-OS_ROOT="../"
-BUILD_SCRIPT="${OS_ROOT}devtools/build_user_c.sh"
+BUILD_SCRIPT="./devtools/build_user_c.sh"
 PACKAGES_DIR="./packages"
 WWW_DIR="./www"
 RELEASES_DIR="${WWW_DIR}/releases"
