@@ -64,4 +64,3 @@ int main(int argc, char** argv) {
     printf("install: complete (%d package(s))\n", plan.count);
     return 0;
 }
-

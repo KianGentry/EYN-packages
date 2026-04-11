@@ -9,6 +9,10 @@
 #include <eynos_cmdmeta.h>
 #include <eynos_syscall.h>
 
+#include <install/index.h>
+#include <install/package.h>
+#include <install/resolve.h>
+
 EYN_CMDMETA_V1("EYN-OS graphical installer.", "installer");
 
 #define MAX_DRIVES 8
@@ -34,9 +38,19 @@ EYN_CMDMETA_V1("EYN-OS graphical installer.", "installer");
 #define INSTALLER_MEDIA_INDEX "RAM:/installer/index.json"
 #define INSTALLER_MEDIA_BASE_ARCHIVE "RAM:/installer/base.pkg"
 #define INSTALLER_MEDIA_BASE_MANIFEST "RAM:/installer/base.manifest"
+#define INSTALLER_MEDIA_ETC_RESOLV "RAM:/etc/resolv.conf"
+#define INSTALLER_MEDIA_CONFIG_DIR "RAM:/config"
+#define INSTALLER_MEDIA_ICONS_DIR "RAM:/icons"
+#define INSTALLER_MEDIA_ICONS16_DIR "RAM:/icons16"
+#define INSTALLER_MEDIA_VIEW_DIR "RAM:/.view"
+#define INSTALLER_MEDIA_FONTS_DIR "RAM:/fonts"
+#define INSTALLER_MEDIA_CHIBICC "RAM:/programs/chibicc"
 
 #define INSTALLER_MAX_MANIFEST_PACKAGES 256
 #define INSTALLER_MAX_PACKAGE_NAME 64
+#define INSTALLER_MAX_FONT_FILES 64
+#define INSTALLER_MAX_FONT_NAME 64
+#define INSTALLER_OPTION_VISIBLE_ROWS 10
 
 /*
  * ABI-INVARIANT: Raw on-disk LBA used for installer-written kernel payload.
@@ -51,11 +65,12 @@ EYN_CMDMETA_V1("EYN-OS graphical installer.", "installer");
 typedef enum {
     STEP_WELCOME = 0,
     STEP_SELECT_DRIVE = 1,
-    STEP_FORMAT = 2,
-    STEP_COPY = 3,
-    STEP_BOOTLOADER = 4,
-    STEP_DONE = 5,
-    STEP_ERROR = 6,
+    STEP_OPTIONS = 2,
+    STEP_FORMAT = 3,
+    STEP_COPY = 4,
+    STEP_BOOTLOADER = 5,
+    STEP_DONE = 6,
+    STEP_ERROR = 7,
 } installer_step_t;
 
 typedef struct {
@@ -63,6 +78,22 @@ typedef struct {
     int drives[MAX_DRIVES];
     int selected_idx;
     int selected_drive;
+
+    int options_loaded;
+    int option_cursor;
+    int option_scroll;
+
+    int package_count;
+    char packages[INSTALLER_MAX_MANIFEST_PACKAGES][INSTALLER_MAX_PACKAGE_NAME];
+    unsigned char package_selected[INSTALLER_MAX_MANIFEST_PACKAGES];
+
+    int font_count;
+    char fonts[INSTALLER_MAX_FONT_FILES][INSTALLER_MAX_FONT_NAME];
+    unsigned char font_selected[INSTALLER_MAX_FONT_FILES];
+
+    int include_icons;
+    int include_fonts;
+    int include_chibicc;
 
     installer_step_t step;
     int running;
@@ -80,6 +111,10 @@ typedef struct {
 static int g_installer_gui_handle = -1;
 static int g_gui_draw_failures = 0;
 static void draw_ui(int h, installer_t* s);
+static int path_is_directory(const char* path);
+static int read_manifest_packages(const char* manifest_path,
+                                  char out_pkgs[INSTALLER_MAX_MANIFEST_PACKAGES][INSTALLER_MAX_PACKAGE_NAME],
+                                  int* out_count);
 
 static int gui_call_ok(int rc, const char* what, installer_t* s) {
     if (rc >= 0) return 1;
@@ -314,6 +349,23 @@ static int installer_ram_preflight(installer_t* s) {
     }
     close(fd);
 
+    fd = open(INSTALLER_MEDIA_ETC_RESOLV, O_RDONLY, 0);
+    if (fd < 0) {
+        error_set(s, "RAM:/etc/resolv.conf missing");
+        return -1;
+    }
+    close(fd);
+
+    if (!path_is_directory(INSTALLER_MEDIA_CONFIG_DIR)) {
+        error_set(s, "RAM:/config missing");
+        return -1;
+    }
+
+    if (!path_is_directory(INSTALLER_MEDIA_VIEW_DIR)) {
+        error_set(s, "RAM:/.view missing");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -323,6 +375,301 @@ static int path_exists(const char* path) {
     if (fd < 0) return 0;
     close(fd);
     return 1;
+}
+
+static int path_is_directory(const char* path) {
+    if (!path || !path[0]) return 0;
+
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) return 0;
+
+    eyn_dirent_t entries[1];
+    int rc = getdents(fd, entries, sizeof(entries));
+    close(fd);
+    return rc >= 0;
+}
+
+static int ensure_target_directory(const char* path) {
+    if (!path || path[0] != '/') return -1;
+
+    char work[256];
+    int needed = snprintf(work, sizeof(work), "%s", path);
+    if (needed <= 0 || needed >= (int)sizeof(work)) return -1;
+
+    size_t len = strlen(work);
+    while (len > 1 && work[len - 1] == '/') {
+        work[len - 1] = '\0';
+        len--;
+    }
+
+    for (size_t i = 1; work[i]; i++) {
+        if (work[i] != '/') continue;
+        work[i] = '\0';
+        if (mkdir(work, 0) != 0 && !path_is_directory(work)) {
+            work[i] = '/';
+            return -1;
+        }
+        work[i] = '/';
+    }
+
+    if (mkdir(work, 0) != 0 && !path_is_directory(work)) return -1;
+    return 0;
+}
+
+static int join_path2(const char* base, const char* leaf, char* out, size_t out_cap) {
+    if (!base || !leaf || !out || out_cap == 0) return -1;
+
+    size_t base_len = strlen(base);
+    int needs_sep = (base_len > 0 && base[base_len - 1] != '/');
+    int needed = snprintf(out,
+                          out_cap,
+                          needs_sep ? "%s/%s" : "%s%s",
+                          base,
+                          leaf);
+    if (needed <= 0 || needed >= (int)out_cap) return -1;
+    return 0;
+}
+
+static int read_directory_file_names(const char* dir_path,
+                                     char out_names[INSTALLER_MAX_FONT_FILES][INSTALLER_MAX_FONT_NAME],
+                                     int max_count,
+                                     int* out_count) {
+    if (!dir_path || !out_names || !out_count || max_count <= 0) return -1;
+
+    int fd = open(dir_path, O_RDONLY, 0);
+    if (fd < 0) {
+        *out_count = 0;
+        return -2;
+    }
+
+    int count = 0;
+    for (;;) {
+        eyn_dirent_t entries[16];
+        int bytes = getdents(fd, entries, sizeof(entries));
+        if (bytes < 0) {
+            close(fd);
+            return -1;
+        }
+        if (bytes == 0) break;
+
+        int entry_count = bytes / (int)sizeof(eyn_dirent_t);
+        for (int i = 0; i < entry_count; i++) {
+            const char* name = entries[i].name;
+            if (!name || !name[0]) continue;
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+            if (entries[i].is_dir) continue;
+
+            if (count >= max_count) {
+                close(fd);
+                return -1;
+            }
+
+            size_t name_len = strlen(name);
+            if (name_len == 0 || name_len >= INSTALLER_MAX_FONT_NAME) {
+                close(fd);
+                return -1;
+            }
+
+            strncpy(out_names[count], name, INSTALLER_MAX_FONT_NAME - 1);
+            out_names[count][INSTALLER_MAX_FONT_NAME - 1] = '\0';
+            count++;
+        }
+    }
+
+    close(fd);
+
+    for (int i = 1; i < count; i++) {
+        char tmp[INSTALLER_MAX_FONT_NAME];
+        strncpy(tmp, out_names[i], sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+
+        int j = i - 1;
+        while (j >= 0 && strcmp(out_names[j], tmp) > 0) {
+            strncpy(out_names[j + 1], out_names[j], INSTALLER_MAX_FONT_NAME - 1);
+            out_names[j + 1][INSTALLER_MAX_FONT_NAME - 1] = '\0';
+            j--;
+        }
+
+        strncpy(out_names[j + 1], tmp, INSTALLER_MAX_FONT_NAME - 1);
+        out_names[j + 1][INSTALLER_MAX_FONT_NAME - 1] = '\0';
+    }
+
+    *out_count = count;
+    return 0;
+}
+
+static int option_row_icons(const installer_t* s) {
+    if (!s) return 0;
+    return s->package_count;
+}
+
+static int option_row_fonts_toggle(const installer_t* s) {
+    if (!s) return 1;
+    return s->package_count + 1;
+}
+
+static int option_row_fonts_first(const installer_t* s) {
+    if (!s) return 2;
+    return s->package_count + 2;
+}
+
+static int option_row_chibicc(const installer_t* s) {
+    if (!s) return 2;
+    return option_row_fonts_first(s) + (s->include_fonts ? s->font_count : 0);
+}
+
+static int option_row_continue(const installer_t* s) {
+    return option_row_chibicc(s) + 1;
+}
+
+static int options_row_count(const installer_t* s) {
+    return option_row_continue(s) + 1;
+}
+
+static int selected_package_count(const installer_t* s) {
+    if (!s) return 0;
+
+    int selected = 0;
+    for (int i = 0; i < s->package_count; i++) {
+        if (s->package_selected[i]) selected++;
+    }
+    return selected;
+}
+
+static int selected_font_count(const installer_t* s) {
+    if (!s || !s->include_fonts) return 0;
+
+    int selected = 0;
+    for (int i = 0; i < s->font_count; i++) {
+        if (s->font_selected[i]) selected++;
+    }
+    return selected;
+}
+
+static void options_ensure_cursor_visible(installer_t* s) {
+    if (!s) return;
+
+    int rows = options_row_count(s);
+    if (rows <= 0) {
+        s->option_cursor = 0;
+        s->option_scroll = 0;
+        return;
+    }
+
+    if (s->option_cursor < 0) s->option_cursor = 0;
+    if (s->option_cursor >= rows) s->option_cursor = rows - 1;
+
+    if (s->option_scroll < 0) s->option_scroll = 0;
+    if (s->option_scroll > s->option_cursor) s->option_scroll = s->option_cursor;
+
+    if (s->option_cursor >= s->option_scroll + INSTALLER_OPTION_VISIBLE_ROWS) {
+        s->option_scroll = s->option_cursor - INSTALLER_OPTION_VISIBLE_ROWS + 1;
+    }
+
+    int max_scroll = rows - INSTALLER_OPTION_VISIBLE_ROWS;
+    if (max_scroll < 0) max_scroll = 0;
+    if (s->option_scroll > max_scroll) s->option_scroll = max_scroll;
+}
+
+static void toggle_all_packages(installer_t* s) {
+    if (!s || s->package_count <= 0) return;
+
+    int any_unselected = 0;
+    for (int i = 0; i < s->package_count; i++) {
+        if (!s->package_selected[i]) {
+            any_unselected = 1;
+            break;
+        }
+    }
+
+    unsigned char new_value = any_unselected ? 1u : 0u;
+    for (int i = 0; i < s->package_count; i++) {
+        s->package_selected[i] = new_value;
+    }
+}
+
+static int toggle_option_row(installer_t* s, int row) {
+    if (!s || row < 0) return -1;
+
+    if (row < s->package_count) {
+        s->package_selected[row] = s->package_selected[row] ? 0u : 1u;
+        return 0;
+    }
+
+    if (row == option_row_icons(s)) {
+        s->include_icons = s->include_icons ? 0 : 1;
+        return 0;
+    }
+
+    if (row == option_row_fonts_toggle(s)) {
+        if (s->font_count <= 0) {
+            s->include_fonts = 0;
+            return 0;
+        }
+        s->include_fonts = s->include_fonts ? 0 : 1;
+        options_ensure_cursor_visible(s);
+        return 0;
+    }
+
+    if (s->include_fonts) {
+        int font_first = option_row_fonts_first(s);
+        int font_last = font_first + s->font_count - 1;
+        if (row >= font_first && row <= font_last) {
+            int font_idx = row - font_first;
+            s->font_selected[font_idx] = s->font_selected[font_idx] ? 0u : 1u;
+            return 0;
+        }
+    }
+
+    if (row == option_row_chibicc(s)) {
+        s->include_chibicc = s->include_chibicc ? 0 : 1;
+        return 0;
+    }
+
+    if (row == option_row_continue(s)) return 1;
+    return -1;
+}
+
+static int installer_prepare_options(installer_t* s) {
+    if (!s) return -1;
+    if (s->options_loaded) return 0;
+
+    if (read_manifest_packages(INSTALLER_MEDIA_BASE_MANIFEST,
+                               s->packages,
+                               &s->package_count) != 0) {
+        return -1;
+    }
+
+    if (s->package_count <= 0) return -1;
+
+    for (int i = 0; i < s->package_count; i++) {
+        s->package_selected[i] = 1u;
+    }
+
+    s->include_icons = 1;
+    s->include_fonts = 0;
+    s->include_chibicc = 0;
+
+    int font_scan_rc = read_directory_file_names(INSTALLER_MEDIA_FONTS_DIR,
+                                                 s->fonts,
+                                                 INSTALLER_MAX_FONT_FILES,
+                                                 &s->font_count);
+    if (font_scan_rc < 0 && font_scan_rc != -2) {
+        return -1;
+    }
+    if (font_scan_rc == -2) {
+        s->font_count = 0;
+    }
+
+    for (int i = 0; i < s->font_count; i++) {
+        s->font_selected[i] = 1u;
+    }
+
+    s->option_cursor = 0;
+    s->option_scroll = 0;
+    s->options_loaded = 1;
+    options_ensure_cursor_visible(s);
+    return 0;
 }
 
 static int copy_media_file_to_target(installer_t* s,
@@ -345,6 +692,191 @@ static int copy_media_file_to_target(installer_t* s,
         else if (cfr < 0) error_set_path_code(s, "Copy target create failed", dst_path, cfr);
         else error_set_path(s, "Copy failed", src_path);
         return -1;
+    }
+
+    if (s) s->copied_files++;
+
+    return 0;
+}
+
+static int copy_media_tree_recursive(installer_t* s,
+                                     const char* src_root,
+                                     const char* dst_root) {
+    if (!src_root || !dst_root) return -1;
+
+    int fd = open(src_root, O_RDONLY, 0);
+    if (fd < 0) return -1;
+
+    if (ensure_target_directory(dst_root) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (s) s->copied_dirs++;
+
+    for (;;) {
+        eyn_dirent_t entries[16];
+        int bytes = getdents(fd, entries, sizeof(entries));
+        if (bytes < 0) {
+            close(fd);
+            return -1;
+        }
+        if (bytes == 0) break;
+
+        int entry_count = bytes / (int)sizeof(eyn_dirent_t);
+        for (int i = 0; i < entry_count; i++) {
+            const char* name = entries[i].name;
+            if (!name || !name[0]) continue;
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+
+            char src_child[256];
+            char dst_child[256];
+            if (join_path2(src_root, name, src_child, sizeof(src_child)) != 0
+                || join_path2(dst_root, name, dst_child, sizeof(dst_child)) != 0) {
+                close(fd);
+                return -1;
+            }
+
+            if (entries[i].is_dir) {
+                if (copy_media_tree_recursive(s, src_child, dst_child) != 0) {
+                    close(fd);
+                    return -1;
+                }
+                continue;
+            }
+
+            if (copy_media_file_to_target(s, src_child, dst_child, dst_child) != 0) {
+                close(fd);
+                return -1;
+            }
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+
+static int copy_media_tree_to_target(installer_t* s,
+                                     const char* src_root,
+                                     const char* dst_root,
+                                     const char* missing_msg) {
+    if (!src_root || !dst_root) return -1;
+
+    if (!path_is_directory(src_root)) {
+        if (missing_msg && missing_msg[0]) {
+            error_set(s, missing_msg);
+        }
+        return -1;
+    }
+
+    if (copy_media_tree_recursive(s, src_root, dst_root) != 0) {
+        error_set_path(s, "Failed to copy media tree", src_root);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int seed_system_content(installer_t* s) {
+    if (!s) return -1;
+
+    if (ensure_target_directory("/etc") != 0) {
+        error_set_path(s, "Failed to create target directory", "/etc");
+        return -1;
+    }
+
+    if (copy_media_file_to_target(s,
+                                  INSTALLER_MEDIA_ETC_RESOLV,
+                                  "/etc/resolv.conf",
+                                  "Seeding /etc/resolv.conf") != 0) {
+        return -1;
+    }
+    progress_step(s, "resolv.conf");
+
+    if (copy_media_tree_to_target(s,
+                                  INSTALLER_MEDIA_CONFIG_DIR,
+                                  "/config",
+                                  "RAM:/config missing") != 0) {
+        return -1;
+    }
+    progress_step(s, "config");
+
+    if (copy_media_tree_to_target(s,
+                                  INSTALLER_MEDIA_VIEW_DIR,
+                                  "/.view",
+                                  "RAM:/.view missing") != 0) {
+        return -1;
+    }
+    progress_step(s, ".view");
+
+    if (s->include_icons) {
+        if (copy_media_tree_to_target(s,
+                                      INSTALLER_MEDIA_ICONS_DIR,
+                                      "/icons",
+                                      "RAM:/icons missing") != 0) {
+            return -1;
+        }
+        progress_step(s, "icons");
+
+        if (copy_media_tree_to_target(s,
+                                      INSTALLER_MEDIA_ICONS16_DIR,
+                                      "/icons16",
+                                      "RAM:/icons16 missing") != 0) {
+            return -1;
+        }
+        progress_step(s, "icons16");
+    }
+
+    if (s->include_fonts) {
+        int fonts_selected = selected_font_count(s);
+        if (fonts_selected <= 0) {
+            error_set(s, "Fonts enabled but no fonts selected");
+            return -1;
+        }
+
+        if (ensure_target_directory("/fonts") != 0) {
+            error_set_path(s, "Failed to create target directory", "/fonts");
+            return -1;
+        }
+
+        for (int i = 0; i < s->font_count; i++) {
+            if (!s->font_selected[i]) continue;
+
+            char src_font[256];
+            char dst_font[256];
+            if (join_path2(INSTALLER_MEDIA_FONTS_DIR, s->fonts[i], src_font, sizeof(src_font)) != 0
+                || join_path2("/fonts", s->fonts[i], dst_font, sizeof(dst_font)) != 0) {
+                error_set(s, "Font path too long");
+                return -1;
+            }
+
+            char item[160];
+            snprintf(item, sizeof(item), "Seeding /fonts/%s", s->fonts[i]);
+            if (copy_media_file_to_target(s, src_font, dst_font, item) != 0) {
+                return -1;
+            }
+            progress_step(s, s->fonts[i]);
+        }
+    }
+
+    if (s->include_chibicc) {
+        if (!path_exists(INSTALLER_MEDIA_CHIBICC)) {
+            error_set(s, "RAM:/programs/chibicc missing");
+            return -1;
+        }
+
+        if (ensure_target_directory("/binaries") != 0) {
+            error_set_path(s, "Failed to create target directory", "/binaries");
+            return -1;
+        }
+
+        if (copy_media_file_to_target(s,
+                                      INSTALLER_MEDIA_CHIBICC,
+                                      "/binaries/chibicc",
+                                      "Seeding /binaries/chibicc") != 0) {
+            return -1;
+        }
+        progress_step(s, "chibicc");
     }
 
     return 0;
@@ -651,37 +1183,42 @@ static int write_grub_cfg(void) {
 }
 
 static int run_install_for_package(installer_t* s,
+                                   const PackageIndex* package_index,
                                    const char* pkg_name,
                                    int index,
                                    int total) {
-    if (!s || !pkg_name || !pkg_name[0]) return -1;
+    if (!s || !package_index || !pkg_name || !pkg_name[0]) return -1;
 
     char status[96];
     snprintf(status, sizeof(status), "Installing package %d/%d", index + 1, total);
     status_set(s, status);
 
-    char item[160];
-    snprintf(item, sizeof(item), "install %s", pkg_name);
-    progress_note_item(s, item);
-
-    const char* argv_local[1];
-    argv_local[0] = pkg_name;
-
-    int pid = spawn("/binaries/install", argv_local, 1);
-    if (pid <= 0) {
-        error_set_path(s, "Failed to launch install command", "/binaries/install");
+    ResolvePlan plan;
+    if (resolve_install_plan(package_index, pkg_name, &plan) != 0) {
+        error_set_path(s, "Failed to resolve install plan", pkg_name);
         return -1;
     }
 
-    int child_status = 0;
-    if (waitpid(pid, &child_status, 0) <= 0) {
-        error_set_path(s, "Failed waiting for install command", pkg_name);
+    if (plan.count <= 0) {
+        error_set_path(s, "Empty install plan", pkg_name);
         return -1;
     }
 
-    if (child_status != 0) {
-        error_set_path_code(s, "Package install failed", pkg_name, child_status);
-        return -1;
+    for (int plan_idx = 0; plan_idx < plan.count; plan_idx++) {
+        const Package* pkg = plan.ordered[plan_idx];
+        if (!pkg || !pkg->name[0]) {
+            error_set_path(s, "Invalid package in install plan", pkg_name);
+            return -1;
+        }
+
+        char item[160];
+        snprintf(item, sizeof(item), "install %s", pkg->name);
+        progress_note_item(s, item);
+
+        if (install_package(package_index, pkg) != 0) {
+            error_set_path(s, "Package install failed", pkg->name);
+            return -1;
+        }
     }
 
     progress_step(s, pkg_name);
@@ -691,13 +1228,29 @@ static int run_install_for_package(installer_t* s,
 static int install_from_package_manifest(installer_t* s) {
     if (!s) return -1;
 
+    if (installer_prepare_options(s) != 0) {
+        error_set(s, "Failed to load installer options");
+        return -1;
+    }
+
+    int packages_selected = selected_package_count(s);
+    if (packages_selected <= 0) {
+        error_set(s, "Select at least one package before install");
+        return -1;
+    }
+
+    int system_seed_steps = 3;
+    if (s->include_icons) system_seed_steps += 2;
+    if (s->include_fonts) system_seed_steps += selected_font_count(s);
+    if (s->include_chibicc) system_seed_steps += 1;
+
     (void)mkdir("/binaries", 0);
     (void)mkdir("/boot", 0);
     (void)mkdir(INSTALL_CACHE_ROOT, 0);
     (void)mkdir(INSTALL_CACHE_PACKAGE_DIR, 0);
 
     status_set(s, "Seeding installer tools and cache ...");
-    progress_reset(s, 7);
+    progress_reset(s, 7 + system_seed_steps);
 
     if (copy_media_file_to_target(s,
                                   INSTALLER_MEDIA_INSTALL,
@@ -763,27 +1316,39 @@ static int install_from_package_manifest(installer_t* s) {
     }
     progress_step(s, "manifest");
 
-    char packages[INSTALLER_MAX_MANIFEST_PACKAGES][INSTALLER_MAX_PACKAGE_NAME];
-    int package_count = 0;
-    if (read_manifest_packages(INSTALL_CACHE_MANIFEST, packages, &package_count) != 0) {
-        error_set(s, "Failed to parse base.manifest");
+    if (seed_system_content(s) != 0) {
         return -1;
     }
 
-    if (package_count <= 0) {
-        error_set(s, "base.manifest has no packages");
+    PackageIndex package_index;
+    if (index_fetch_and_parse(&package_index) != 0) {
+        error_set(s, "Failed to load package index");
         return -1;
     }
 
     s->step = STEP_COPY;
     status_set(s, "Installing base packages ...");
-    progress_reset(s, package_count);
+    progress_reset(s, packages_selected);
 
-    for (int i = 0; i < package_count; i++) {
-        if (run_install_for_package(s, packages[i], i, package_count) != 0) {
+    int previous_confirm_mode = package_set_confirm_mode(PACKAGE_CONFIRM_AUTO_ACCEPT);
+
+    int install_index = 0;
+    for (int i = 0; i < s->package_count; i++) {
+        if (!s->package_selected[i]) continue;
+
+        if (run_install_for_package(s,
+                                    &package_index,
+                                    s->packages[i],
+                                    install_index,
+                                    packages_selected) != 0) {
+            (void)package_set_confirm_mode(previous_confirm_mode);
             return -1;
         }
+
+        install_index++;
     }
+
+    (void)package_set_confirm_mode(previous_confirm_mode);
 
     return 0;
 }
@@ -909,6 +1474,89 @@ static void draw_ui(int h, installer_t* s) {
         if (s->drive_count == 0) {
             draw_center_text(h, 72, "No drives detected", 255, 140, 140);
         }
+    } else if (s->step == STEP_OPTIONS) {
+        int selected_pkgs = selected_package_count(s);
+        int selected_fonts = selected_font_count(s);
+
+        char summary_pkgs[96];
+        char summary_assets[128];
+        snprintf(summary_pkgs,
+                 sizeof(summary_pkgs),
+                 "Packages selected: %d / %d",
+                 selected_pkgs,
+                 s->package_count);
+        snprintf(summary_assets,
+                 sizeof(summary_assets),
+                 "Icons: %s   Fonts: %s (%d)   Chibicc: %s",
+                 s->include_icons ? "on" : "off",
+                 s->include_fonts ? "on" : "off",
+                 selected_fonts,
+                 s->include_chibicc ? "on" : "off");
+
+        draw_center_text(h, 42, "Configure install options (menuconfig-style)", 220, 220, 220);
+        draw_center_text(h, 62, summary_pkgs, 180, 200, 220);
+        draw_center_text(h, 80, summary_assets, 170, 190, 210);
+
+        int rows = options_row_count(s);
+        int first = s->option_scroll;
+        int last = first + INSTALLER_OPTION_VISIBLE_ROWS;
+        if (last > rows) last = rows;
+
+        int y = 106;
+        for (int row = first; row < last; row++) {
+            int is_cursor = (row == s->option_cursor);
+            if (is_cursor) {
+                gui_rect_t sel = {8, y - 2, sz.w - 16, 16, GUI_PAL_SEL_R, GUI_PAL_SEL_G, GUI_PAL_SEL_B, 0};
+                if (!gui_call_ok(gui_fill_rect(h, &sel), "gui_fill_rect(options)", s)) return;
+            }
+
+            char line[176];
+            if (row < s->package_count) {
+                snprintf(line,
+                         sizeof(line),
+                         "[%c] package: %s",
+                         s->package_selected[row] ? 'x' : ' ',
+                         s->packages[row]);
+            } else if (row == option_row_icons(s)) {
+                snprintf(line,
+                         sizeof(line),
+                         "[%c] seed /icons and /icons16",
+                         s->include_icons ? 'x' : ' ');
+            } else if (row == option_row_fonts_toggle(s)) {
+                if (s->font_count > 0) {
+                    snprintf(line,
+                             sizeof(line),
+                             "[%c] seed fonts",
+                             s->include_fonts ? 'x' : ' ');
+                } else {
+                    snprintf(line, sizeof(line), "[ ] seed fonts (none available on media)");
+                }
+            } else if (s->include_fonts
+                       && row >= option_row_fonts_first(s)
+                       && row < option_row_fonts_first(s) + s->font_count) {
+                int font_idx = row - option_row_fonts_first(s);
+                snprintf(line,
+                         sizeof(line),
+                         "    [%c] font: %s",
+                         s->font_selected[font_idx] ? 'x' : ' ',
+                         s->fonts[font_idx]);
+            } else if (row == option_row_chibicc(s)) {
+                snprintf(line,
+                         sizeof(line),
+                         "[%c] seed /binaries/chibicc",
+                         s->include_chibicc ? 'x' : ' ');
+            } else if (row == option_row_continue(s)) {
+                snprintf(line, sizeof(line), "[>] continue to disk format");
+            } else {
+                snprintf(line, sizeof(line), "");
+            }
+
+            draw_center_text(h, y, line, 230, 230, 230);
+            y += 18;
+        }
+
+        draw_center_text(h, 306, "Up/Down: move   Enter/Space: toggle", 170, 170, 170);
+        draw_center_text(h, 324, "A: toggle all packages   B: back   I: continue", 170, 170, 170);
     } else if (s->step == STEP_FORMAT) {
         char line[96];
         snprintf(line, sizeof(line), "Target drive: %d", s->selected_drive);
@@ -1022,8 +1670,43 @@ int main(void) {
                 if (ev.a == GUI_KEY_DOWN && st.selected_idx + 1 < st.drive_count) st.selected_idx++;
                 if ((ch == '\r' || ch == '\n') && st.drive_count > 0) {
                     st.selected_drive = st.drives[st.selected_idx];
-                    st.step = STEP_FORMAT;
+                    if (installer_prepare_options(&st) != 0) {
+                        error_set(&st, "Failed to load installer options");
+                        st.step = STEP_ERROR;
+                    } else {
+                        st.step = STEP_OPTIONS;
+                    }
                 }
+            } else if (st.step == STEP_OPTIONS) {
+                if (ev.a == GUI_KEY_UP && st.option_cursor > 0) {
+                    st.option_cursor--;
+                }
+                if (ev.a == GUI_KEY_DOWN && st.option_cursor + 1 < options_row_count(&st)) {
+                    st.option_cursor++;
+                }
+
+                if (ch == 'a' || ch == 'A') {
+                    toggle_all_packages(&st);
+                } else if (ch == 'b' || ch == 'B') {
+                    st.step = STEP_SELECT_DRIVE;
+                } else if (ch == 'i' || ch == 'I') {
+                    if (selected_package_count(&st) <= 0) {
+                        status_set(&st, "Select at least one package");
+                    } else {
+                        st.step = STEP_FORMAT;
+                    }
+                } else if (ch == '\r' || ch == '\n' || ch == ' ') {
+                    int row_action = toggle_option_row(&st, st.option_cursor);
+                    if (row_action == 1) {
+                        if (selected_package_count(&st) <= 0) {
+                            status_set(&st, "Select at least one package");
+                        } else {
+                            st.step = STEP_FORMAT;
+                        }
+                    }
+                }
+
+                options_ensure_cursor_visible(&st);
             } else if (st.step == STEP_FORMAT) {
                 if (ch == '\r' || ch == '\n') {
                     st.step = STEP_COPY;
