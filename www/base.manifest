@@ -1,6 +1,7 @@
 # EYN-OS base package manifest v1
 alias
 assertfail
+breakout
 calc
 cat
 cd
@@ -73,10 +74,12 @@ setfont
 settings
 sha256
 size
+snake
 sort
 spam
 stats
 tail
+tetris
 theme
 tiling
 title
