@@ -35,24 +35,45 @@ normalize_system_flag() {
     esac
 }
 
-read_package_system_flag() {
+read_package_meta_flag() {
     local pkg_dir="$1"
+    local flag="$2"
+    local default="$3"
     local meta_file="${pkg_dir%/}/package.meta"
 
     if [ ! -f "$meta_file" ]; then
-        echo "true"
+        echo "$default"
         return 0
     fi
 
     local line=""
-    line="$(grep -Ei '^[[:space:]]*SYSTEM[[:space:]]*=' "$meta_file" | tail -n 1 || true)"
+    line="$(grep -Ei "^[[:space:]]*${flag}[[:space:]]*=" "$meta_file" | tail -n 1 || true)"
     if [ -z "$line" ]; then
-        echo "true"
+        echo "$default"
         return 0
     fi
 
     local value="${line#*=}"
-    normalize_system_flag "$value"
+    value="${value//[[:space:]]/}"
+    echo "$value"
+}
+
+read_package_system_flag() {
+    local pkg_dir="$1"
+    local raw
+    raw="$(read_package_meta_flag "$pkg_dir" "SYSTEM" "")"
+    normalize_system_flag "$raw"
+}
+
+read_package_prebuilt_flag() {
+    local pkg_dir="$1"
+    local raw
+    raw="$(read_package_meta_flag "$pkg_dir" "PREBUILT" "false")"
+    raw="${raw,,}"
+    case "$raw" in
+        "1"|"true"|"yes"|"on") echo "true" ;;
+        *)                      echo "false" ;;
+    esac
 }
 
 tarball_has_payload() {
@@ -110,14 +131,64 @@ declare -a system_tarballs
 for pkg_dir in "$PACKAGES_DIR"/*/; do
     pkgname=$(basename "$pkg_dir")
     src="${pkg_dir}${pkgname}_uelf.c"
+    prebuilt_bin="${pkg_dir}${pkgname}"
+    pkg_system="$(read_package_system_flag "$pkg_dir")"
+    pkg_prebuilt="$(read_package_prebuilt_flag "$pkg_dir")"
+    tarball="${pkgname}-${VERSION}-i386.tar.gz"
 
+    # --- Prebuilt binary path ---
+    if [ "$pkg_prebuilt" = "true" ]; then
+        if [ ! -f "$prebuilt_bin" ]; then
+            echo "warning: PREBUILT=true for ${pkgname} but no binary found at ${prebuilt_bin}, skipping"
+            continue
+        fi
+
+        if [ -f "${RELEASES_DIR}/${tarball}" ] \
+            && [ "${RELEASES_DIR}/${tarball}" -nt "$prebuilt_bin" ] \
+            && tarball_has_payload "${RELEASES_DIR}/${tarball}" "${pkgname}"; then
+            echo "  skipping ${pkgname} (prebuilt, unchanged)"
+            sha=$(sha256sum "${RELEASES_DIR}/${tarball}" | awk '{print $1}')
+            append_index_entry "$pkgname" "$tarball" "$sha" "$pkg_system"
+            if [ "$pkg_system" = "true" ]; then
+                system_package_names+=("$pkgname")
+                system_tarballs+=("$tarball")
+            fi
+            continue
+        fi
+
+        echo "Packaging prebuilt ${pkgname}..."
+
+        staging="/tmp/eynpkg_${pkgname}"
+        rm -rf "$staging"
+        mkdir -p "$staging"
+        cp "$prebuilt_bin" "${staging}/${pkgname}"
+
+        tar -czf "${RELEASES_DIR}/${tarball}" -C "$staging" .
+        rm -rf "$staging"
+
+        if ! tarball_has_payload "${RELEASES_DIR}/${tarball}" "${pkgname}"; then
+            echo "error: tarball for prebuilt ${pkgname} has no installable payload, skipping"
+            rm -f "${RELEASES_DIR}/${tarball}"
+            continue
+        fi
+
+        sha=$(sha256sum "${RELEASES_DIR}/${tarball}" | awk '{print $1}')
+        append_index_entry "$pkgname" "$tarball" "$sha" "$pkg_system"
+
+        if [ "$pkg_system" = "true" ]; then
+            system_package_names+=("$pkgname")
+            system_tarballs+=("$tarball")
+        fi
+
+        echo "  packaged: ${tarball} [${sha}]"
+        continue
+    fi
+
+    # --- Source build path ---
     if [ ! -f "$src" ]; then
         echo "warning: no source found for ${pkgname}, skipping"
         continue
     fi
-
-    pkg_system="$(read_package_system_flag "$pkg_dir")"
-    tarball="${pkgname}-${VERSION}-i386.tar.gz"
 
     if [ -f "${RELEASES_DIR}/${tarball}" ] \
         && [ "${RELEASES_DIR}/${tarball}" -nt "$src" ] \
