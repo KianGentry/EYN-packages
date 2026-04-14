@@ -11,16 +11,24 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "mbedtls/ssl.h"
+#include "mbedtls/ssl_ciphersuites.h"
+#include "mbedtls/error.h"
+
 #define PKG_HTTP_MAX_HOST 128
 #define PKG_HTTP_MAX_PATH 256
 #define PKG_HTTP_MAX_HEADER 4096
 #define PKG_HTTP_RECV_BUF 1536
 #define PKG_HTTP_CHUNK_BUF 4096
-#define PKG_HTTP_IDLE_RECV_LIMIT 1500
+#define PKG_HTTP_IDLE_RECV_LIMIT 6000
+#define PKG_HTTP_MAX_REDIRECTS 5
 #define PKG_DOWNLOAD_DEFAULT_MAX (8u * 1024u * 1024u)
 #define PKG_INSTALL_PATH_CAP 256
 #define PKG_TEMP_PATH_CAP 320
 #define PKG_IO_CHUNK 1024
+#define PKG_DNS_FALLBACK_HOST "eynos.duckdns.org"
+#define PKG_DNS_FALLBACK_IP "192.168.1.200"
+#define PKG_DNS_FALLBACK_IP_ALT "10.0.2.2"
 
 #define PKG_LOCAL_CACHE_ROOT "/cache"
 #define PKG_LOCAL_PACKAGE_CACHE_DIR "/cache/pkg"
@@ -35,7 +43,14 @@ typedef struct {
     char host[PKG_HTTP_MAX_HOST];
     char path[PKG_HTTP_MAX_PATH];
     uint16_t port;
+    uint8_t is_https;
 } pkg_http_url_t;
+
+typedef struct {
+    uint8_t rx_buf[PKG_HTTP_RECV_BUF];
+    size_t rx_off;
+    size_t rx_len;
+} pkg_tls_io_ctx_t;
 
 typedef int (*pkg_body_writer_fn)(const uint8_t* data, size_t len, void* ctx);
 
@@ -217,14 +232,61 @@ static int pkg_parse_ipv4_str(const char* s, uint8_t out[4]) {
     return (*s == '\0') ? 0 : -1;
 }
 
+static int pkg_host_equals_ci(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        if (pkg_ascii_lower(*a) != pkg_ascii_lower(*b)) return 0;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static int pkg_ipv4_equal(const uint8_t a[4], const uint8_t b[4]) {
+    if (!a || !b) return 0;
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static int pkg_resolve_host_ipv4(const char* host, uint8_t out[4]) {
+    if (!host || !out) return -1;
+
+    if (pkg_host_equals_ci(host, PKG_DNS_FALLBACK_HOST) &&
+        pkg_parse_ipv4_str(PKG_DNS_FALLBACK_IP, out) == 0) {
+        printf("install: using pinned fallback IP %s for %s\n",
+               PKG_DNS_FALLBACK_IP,
+               host);
+        return 0;
+    }
+
+    if (pkg_parse_ipv4_str(host, out) == 0) return 0;
+    if (eyn_sys_net_dns_resolve(host, out) == 0) return 0;
+
+    if (pkg_host_equals_ci(host, PKG_DNS_FALLBACK_HOST)
+        && pkg_parse_ipv4_str(PKG_DNS_FALLBACK_IP, out) == 0) {
+        printf("install: DNS failed for %s, using fallback IP %s\n", host, PKG_DNS_FALLBACK_IP);
+        return 0;
+    }
+
+    printf("install: DNS failed for %s\n", host);
+    return -1;
+}
+
 static int pkg_parse_http_url(const char* url, pkg_http_url_t* out) {
     if (!url || !out) return -1;
 
-    const char* prefix = "http://";
-    size_t prefix_len = strlen(prefix);
-    if (strncmp(url, prefix, prefix_len) != 0) return -1;
+    const char* p = NULL;
+    if (strncmp(url, "http://", 7) == 0) {
+        out->is_https = 0;
+        out->port = 80;
+        p = url + 7;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        out->is_https = 1;
+        out->port = 443;
+        p = url + 8;
+    } else {
+        return -1;
+    }
 
-    const char* p = url + prefix_len;
     const char* host_start = p;
     while (*p && *p != '/' && *p != ':') p++;
 
@@ -234,7 +296,6 @@ static int pkg_parse_http_url(const char* url, pkg_http_url_t* out) {
     memcpy(out->host, host_start, host_len);
     out->host[host_len] = '\0';
 
-    out->port = 80;
     if (*p == ':') {
         p++;
         int port = 0;
@@ -259,6 +320,59 @@ static int pkg_parse_http_url(const char* url, pkg_http_url_t* out) {
     if (path_len >= sizeof(out->path)) return -1;
     memcpy(out->path, p, path_len + 1);
     return 0;
+}
+
+static int pkg_url_is_absolute(const char* s) {
+    if (!s) return 0;
+    return strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0;
+}
+
+static int pkg_make_redirect_url(const pkg_http_url_t* base,
+                                 const char* location,
+                                 char* out,
+                                 size_t out_cap) {
+    if (!base || !location || !out || out_cap == 0) return -1;
+
+    if (pkg_url_is_absolute(location)) {
+        if (strlen(location) >= out_cap) return -1;
+        strncpy(out, location, out_cap - 1);
+        out[out_cap - 1] = '\0';
+        return 0;
+    }
+
+    char path[PKG_HTTP_MAX_PATH];
+    if (location[0] == '/') {
+        strncpy(path, location, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    } else {
+        strncpy(path, base->path, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+
+        char* last = strrchr(path, '/');
+        if (!last) {
+            strncpy(path, "/", sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+        } else {
+            last[1] = '\0';
+        }
+
+        if (strlen(path) + strlen(location) + 1 >= sizeof(path)) return -1;
+        strcat(path, location);
+    }
+
+    uint16_t default_port = base->is_https ? 443 : 80;
+    char port_suffix[16] = {0};
+    if (base->port != default_port) {
+        snprintf(port_suffix, sizeof(port_suffix), ":%u", (unsigned)base->port);
+    }
+
+    const char* scheme = base->is_https ? "https://" : "http://";
+    int needed = snprintf(out, out_cap, "%s%s%s%s", scheme, base->host, port_suffix, path);
+    return (needed < 0 || (size_t)needed >= out_cap) ? -1 : 0;
+}
+
+static int pkg_is_redirect_status(int status) {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
 static int pkg_header_key_match(const char* line, const char* key) {
@@ -378,10 +492,525 @@ static int pkg_tcp_send_all(const void* buf, size_t len) {
     return 0;
 }
 
-static int pkg_http_get_stream(const char* url,
-                               pkg_body_writer_fn writer,
-                               void* writer_ctx,
-                               size_t* out_bytes) {
+static int pkg_tls_rng(void* ctx, unsigned char* out, size_t len) {
+    (void)ctx;
+
+    static uint32_t s = 0;
+    if (s == 0) {
+        s = (uint32_t)eyn_syscall0(EYN_SYSCALL_GET_TICKS_MS) ^ 0x7f4a7c15u;
+        if (s == 0) s = 1;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        out[i] = (unsigned char)(s & 0xffu);
+    }
+
+    return 0;
+}
+
+static int pkg_tls_send_cb(void* ctx, const unsigned char* buf, size_t len) {
+    (void)ctx;
+    if (!buf || len == 0) return 0;
+
+    size_t chunk = len;
+    if (chunk > 512) chunk = 512;
+
+    int rc = eyn_sys_net_tcp_send(buf, (uint32_t)chunk);
+    if (rc < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    if (rc == 0) return MBEDTLS_ERR_SSL_WANT_WRITE;
+    return rc;
+}
+
+static int pkg_tls_recv_cb(void* ctx, unsigned char* buf, size_t len) {
+    pkg_tls_io_ctx_t* io = (pkg_tls_io_ctx_t*)ctx;
+    if (!buf || len == 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+
+    if (!io) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+
+    if (io->rx_off < io->rx_len) {
+        size_t avail = io->rx_len - io->rx_off;
+        size_t take = (len < avail) ? len : avail;
+        memcpy(buf, io->rx_buf + io->rx_off, take);
+        io->rx_off += take;
+        if (io->rx_off == io->rx_len) {
+            io->rx_off = 0;
+            io->rx_len = 0;
+        }
+        return (int)take;
+    }
+
+    int rc = eyn_sys_net_tcp_recv(io->rx_buf, (uint32_t)sizeof(io->rx_buf));
+    if (rc > 0) {
+        io->rx_off = 0;
+        io->rx_len = (size_t)rc;
+
+        size_t take = (len < io->rx_len) ? len : io->rx_len;
+        memcpy(buf, io->rx_buf, take);
+        io->rx_off = take;
+        if (io->rx_off == io->rx_len) {
+            io->rx_off = 0;
+            io->rx_len = 0;
+        }
+        return (int)take;
+    }
+    if (rc == 0) return MBEDTLS_ERR_SSL_WANT_READ;
+    if (rc == -2) return MBEDTLS_ERR_SSL_CONN_EOF;
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+}
+
+static int pkg_tls_connect_handshake(const pkg_http_url_t* parts,
+                                     const uint8_t ip[4],
+                                     mbedtls_ssl_context* ssl,
+                                     mbedtls_ssl_config* conf,
+                                     pkg_tls_io_ctx_t* io_ctx) {
+    if (!parts || !ip || !ssl || !conf || !io_ctx) return -1;
+
+    if (eyn_sys_net_tcp_connect(ip, parts->port, 0) != 0) {
+        printf("install: TCP connect failed for %s:%u via %u.%u.%u.%u\n",
+               parts->host,
+               (unsigned)parts->port,
+               (unsigned)ip[0],
+               (unsigned)ip[1],
+               (unsigned)ip[2],
+               (unsigned)ip[3]);
+        return -1;
+    }
+
+    mbedtls_ssl_init(ssl);
+    mbedtls_ssl_config_init(conf);
+
+    int rc = mbedtls_ssl_config_defaults(conf,
+                                         MBEDTLS_SSL_IS_CLIENT,
+                                         MBEDTLS_SSL_TRANSPORT_STREAM,
+                                         MBEDTLS_SSL_PRESET_DEFAULT);
+    if (rc != 0) {
+        printf("install: TLS config failed (code %d)\n", rc);
+        mbedtls_ssl_config_free(conf);
+        mbedtls_ssl_free(ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    mbedtls_ssl_conf_authmode(conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(conf, pkg_tls_rng, NULL);
+
+    rc = mbedtls_ssl_conf_max_frag_len(conf, MBEDTLS_SSL_MAX_FRAG_LEN_512);
+    if (rc != 0) {
+        printf("install: TLS max fragment config failed (code %d)\n", rc);
+    }
+
+    rc = mbedtls_ssl_setup(ssl, conf);
+    if (rc != 0) {
+        printf("install: TLS setup failed (code %d)\n", rc);
+        mbedtls_ssl_config_free(conf);
+        mbedtls_ssl_free(ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    rc = mbedtls_ssl_set_hostname(ssl, parts->host);
+    if (rc != 0) {
+        printf("install: TLS SNI set failed for %s (code %d)\n",
+               parts->host,
+               rc);
+        mbedtls_ssl_config_free(conf);
+        mbedtls_ssl_free(ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    io_ctx->rx_off = 0;
+    io_ctx->rx_len = 0;
+    mbedtls_ssl_set_bio(ssl, io_ctx, pkg_tls_send_cb, pkg_tls_recv_cb, NULL);
+
+    int handshake_polls = 0;
+    for (;;) {
+        rc = mbedtls_ssl_handshake(ssl);
+        if (rc == 0) {
+            break;
+        }
+
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            handshake_polls++;
+            if (handshake_polls >= PKG_HTTP_IDLE_RECV_LIMIT) {
+                printf("install: TLS handshake timeout via %u.%u.%u.%u\n",
+                       (unsigned)ip[0],
+                       (unsigned)ip[1],
+                       (unsigned)ip[2],
+                       (unsigned)ip[3]);
+                mbedtls_ssl_config_free(conf);
+                mbedtls_ssl_free(ssl);
+                (void)eyn_sys_net_tcp_close();
+                return -1;
+            }
+            usleep(10000);
+            continue;
+        }
+
+        printf("install: TLS handshake failed (code %d) via %u.%u.%u.%u\n",
+               rc,
+               (unsigned)ip[0],
+               (unsigned)ip[1],
+               (unsigned)ip[2],
+               (unsigned)ip[3]);
+        mbedtls_ssl_config_free(conf);
+        mbedtls_ssl_free(ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    return 0;
+}
+
+static int pkg_https_get_stream_once(const char* url,
+                                     const pkg_http_url_t* parts,
+                                     pkg_body_writer_fn writer,
+                                     void* writer_ctx,
+                                     size_t* out_bytes,
+                                     char* out_redirect_url,
+                                     size_t out_redirect_url_cap) {
+    if (!url || !parts || !writer || !out_bytes) return -1;
+
+    uint8_t dst_ip[4];
+    if (pkg_resolve_host_ipv4(parts->host, dst_ip) != 0) return -1;
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    pkg_tls_io_ctx_t tls_io;
+    uint8_t primary_fallback_ip[4];
+    uint8_t alt_fallback_ip[4];
+    int can_retry_alt = 0;
+
+    if (pkg_host_equals_ci(parts->host, PKG_DNS_FALLBACK_HOST) &&
+        pkg_parse_ipv4_str(PKG_DNS_FALLBACK_IP, primary_fallback_ip) == 0 &&
+        pkg_parse_ipv4_str(PKG_DNS_FALLBACK_IP_ALT, alt_fallback_ip) == 0 &&
+        pkg_ipv4_equal(dst_ip, primary_fallback_ip)) {
+        can_retry_alt = 1;
+    }
+
+    if (pkg_tls_connect_handshake(parts, dst_ip, &ssl, &conf, &tls_io) != 0) {
+        if (!can_retry_alt) {
+            return -1;
+        }
+
+        printf("install: retrying TLS via alternate fallback IP %s\n",
+               PKG_DNS_FALLBACK_IP_ALT);
+
+        if (pkg_tls_connect_handshake(parts, alt_fallback_ip, &ssl, &conf, &tls_io) != 0) {
+            return -1;
+        }
+    }
+
+    int rc = 0;
+
+    char req[512];
+    int req_len = snprintf(req,
+                           sizeof(req),
+                           "GET %s HTTP/1.1\r\n"
+                           "Host: %s\r\n"
+                           "User-Agent: EYN-OS/install\r\n"
+                           "Connection: close\r\n\r\n",
+                           parts->path,
+                           parts->host);
+    if (req_len <= 0 || req_len >= (int)sizeof(req)) {
+        puts("install: HTTPS request too large");
+        (void)mbedtls_ssl_close_notify(&ssl);
+        mbedtls_ssl_config_free(&conf);
+        mbedtls_ssl_free(&ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    size_t sent = 0;
+    while (sent < (size_t)req_len) {
+        rc = mbedtls_ssl_write(&ssl,
+                               (const unsigned char*)req + sent,
+                               (size_t)req_len - sent);
+        if (rc > 0) {
+            sent += (size_t)rc;
+            continue;
+        }
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            usleep(1000);
+            continue;
+        }
+
+        printf("install: HTTPS send failed (%d)\n", rc);
+        (void)mbedtls_ssl_close_notify(&ssl);
+        mbedtls_ssl_config_free(&conf);
+        mbedtls_ssl_free(&ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    char header[PKG_HTTP_MAX_HEADER];
+    size_t header_len = 0;
+    int header_done = 0;
+    int status = 0;
+
+    int chunked = 0;
+    long content_length = -1;
+
+    uint8_t chunk_buf[PKG_HTTP_CHUNK_BUF];
+    size_t chunk_len = 0;
+    size_t chunk_need = 0;
+    int chunk_have_size = 0;
+    int chunk_done = 0;
+
+    size_t total_written = 0;
+    int idle_recv_polls = 0;
+
+    for (;;) {
+        uint8_t rx_buf[PKG_HTTP_RECV_BUF];
+        rc = mbedtls_ssl_read(&ssl, rx_buf, sizeof(rx_buf));
+
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            idle_recv_polls++;
+            if (idle_recv_polls >= PKG_HTTP_IDLE_RECV_LIMIT) {
+                puts("install: HTTPS receive timeout");
+                (void)mbedtls_ssl_close_notify(&ssl);
+                mbedtls_ssl_config_free(&conf);
+                mbedtls_ssl_free(&ssl);
+                (void)eyn_sys_net_tcp_close();
+                return -1;
+            }
+            usleep(10000);
+            continue;
+        }
+
+        if (rc == 0 || rc == MBEDTLS_ERR_SSL_CONN_EOF || rc == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            break;
+        }
+
+        if (rc < 0) {
+            printf("install: HTTPS receive failed (%d)\n", rc);
+            (void)mbedtls_ssl_close_notify(&ssl);
+            mbedtls_ssl_config_free(&conf);
+            mbedtls_ssl_free(&ssl);
+            (void)eyn_sys_net_tcp_close();
+            return -1;
+        }
+
+        idle_recv_polls = 0;
+
+        if (!header_done) {
+            if (header_len + (size_t)rc >= sizeof(header)) {
+                puts("install: response headers too large");
+                (void)mbedtls_ssl_close_notify(&ssl);
+                mbedtls_ssl_config_free(&conf);
+                mbedtls_ssl_free(&ssl);
+                (void)eyn_sys_net_tcp_close();
+                return -1;
+            }
+
+            memcpy(header + header_len, rx_buf, (size_t)rc);
+            header_len += (size_t)rc;
+            header[header_len] = '\0';
+
+            char* marker = strstr(header, "\r\n\r\n");
+            if (!marker) continue;
+
+            size_t header_end = (size_t)(marker - header) + 4;
+            *marker = '\0';
+            header_done = 1;
+
+            status = pkg_parse_status_code(header);
+            if (pkg_is_redirect_status(status)) {
+                char location[MAX_URL];
+                location[0] = '\0';
+                if (pkg_header_get_value(header,
+                                         "Location",
+                                         location,
+                                         sizeof(location)) != 0
+                    || location[0] == '\0') {
+                    printf("install: HTTP status %d with missing Location for %s\n", status, url);
+                    (void)mbedtls_ssl_close_notify(&ssl);
+                    mbedtls_ssl_config_free(&conf);
+                    mbedtls_ssl_free(&ssl);
+                    (void)eyn_sys_net_tcp_close();
+                    return -1;
+                }
+
+                if (!out_redirect_url || out_redirect_url_cap == 0
+                    || pkg_make_redirect_url(parts,
+                                             location,
+                                             out_redirect_url,
+                                             out_redirect_url_cap) != 0) {
+                    puts("install: redirect URL is too long");
+                    (void)mbedtls_ssl_close_notify(&ssl);
+                    mbedtls_ssl_config_free(&conf);
+                    mbedtls_ssl_free(&ssl);
+                    (void)eyn_sys_net_tcp_close();
+                    return -1;
+                }
+
+                (void)mbedtls_ssl_close_notify(&ssl);
+                mbedtls_ssl_config_free(&conf);
+                mbedtls_ssl_free(&ssl);
+                (void)eyn_sys_net_tcp_close();
+                return 1;
+            }
+
+            if (status != 200 && status != 206) {
+                printf("install: HTTP status %d for %s\n", status, url);
+                (void)mbedtls_ssl_close_notify(&ssl);
+                mbedtls_ssl_config_free(&conf);
+                mbedtls_ssl_free(&ssl);
+                (void)eyn_sys_net_tcp_close();
+                return -1;
+            }
+
+            char transfer_encoding[64];
+            transfer_encoding[0] = '\0';
+            if (pkg_header_get_value(header,
+                                     "Transfer-Encoding",
+                                     transfer_encoding,
+                                     sizeof(transfer_encoding)) == 0) {
+                if (pkg_string_contains_ci(transfer_encoding, "chunked")) {
+                    chunked = 1;
+                }
+            }
+
+            char content_len_str[32];
+            content_len_str[0] = '\0';
+            if (pkg_header_get_value(header,
+                                     "Content-Length",
+                                     content_len_str,
+                                     sizeof(content_len_str)) == 0) {
+                content_length = strtol(content_len_str, NULL, 10);
+                if (content_length < 0) content_length = -1;
+            }
+
+            size_t body_len = header_len - header_end;
+            if (body_len > 0) {
+                if (!chunked) {
+                    if (writer((const uint8_t*)(header + header_end), body_len, writer_ctx) != 0) {
+                        puts("install: body write failed");
+                        (void)mbedtls_ssl_close_notify(&ssl);
+                        mbedtls_ssl_config_free(&conf);
+                        mbedtls_ssl_free(&ssl);
+                        (void)eyn_sys_net_tcp_close();
+                        return -1;
+                    }
+                    total_written += body_len;
+                } else {
+                    if (body_len > sizeof(chunk_buf)) {
+                        puts("install: chunk buffer overflow");
+                        (void)mbedtls_ssl_close_notify(&ssl);
+                        mbedtls_ssl_config_free(&conf);
+                        mbedtls_ssl_free(&ssl);
+                        (void)eyn_sys_net_tcp_close();
+                        return -1;
+                    }
+                    memcpy(chunk_buf, header + header_end, body_len);
+                    chunk_len = body_len;
+                }
+            }
+        } else {
+            if (!chunked) {
+                if (writer(rx_buf, (size_t)rc, writer_ctx) != 0) {
+                    puts("install: body write failed");
+                    (void)mbedtls_ssl_close_notify(&ssl);
+                    mbedtls_ssl_config_free(&conf);
+                    mbedtls_ssl_free(&ssl);
+                    (void)eyn_sys_net_tcp_close();
+                    return -1;
+                }
+                total_written += (size_t)rc;
+            } else {
+                if (chunk_len + (size_t)rc > sizeof(chunk_buf)) {
+                    puts("install: chunk buffer overflow");
+                    (void)mbedtls_ssl_close_notify(&ssl);
+                    mbedtls_ssl_config_free(&conf);
+                    mbedtls_ssl_free(&ssl);
+                    (void)eyn_sys_net_tcp_close();
+                    return -1;
+                }
+                memcpy(chunk_buf + chunk_len, rx_buf, (size_t)rc);
+                chunk_len += (size_t)rc;
+            }
+        }
+
+        if (chunked) {
+            while (!chunk_done) {
+                if (!chunk_have_size) {
+                    size_t line_end = 0;
+                    while (line_end + 1 < chunk_len) {
+                        if (chunk_buf[line_end] == '\r' && chunk_buf[line_end + 1] == '\n') break;
+                        line_end++;
+                    }
+                    if (line_end + 1 >= chunk_len) break;
+
+                    if (pkg_parse_hex_size((const char*)chunk_buf, line_end, &chunk_need) != 0) {
+                        puts("install: invalid chunk size");
+                        (void)mbedtls_ssl_close_notify(&ssl);
+                        mbedtls_ssl_config_free(&conf);
+                        mbedtls_ssl_free(&ssl);
+                        (void)eyn_sys_net_tcp_close();
+                        return -1;
+                    }
+
+                    size_t consume = line_end + 2;
+                    memmove(chunk_buf, chunk_buf + consume, chunk_len - consume);
+                    chunk_len -= consume;
+                    chunk_have_size = 1;
+
+                    if (chunk_need == 0) {
+                        chunk_done = 1;
+                        break;
+                    }
+                }
+
+                if (chunk_have_size) {
+                    if (chunk_len < chunk_need + 2) break;
+
+                    if (writer(chunk_buf, chunk_need, writer_ctx) != 0) {
+                        puts("install: body write failed");
+                        (void)mbedtls_ssl_close_notify(&ssl);
+                        mbedtls_ssl_config_free(&conf);
+                        mbedtls_ssl_free(&ssl);
+                        (void)eyn_sys_net_tcp_close();
+                        return -1;
+                    }
+                    total_written += chunk_need;
+
+                    size_t consume = chunk_need + 2;
+                    memmove(chunk_buf, chunk_buf + consume, chunk_len - consume);
+                    chunk_len -= consume;
+                    chunk_have_size = 0;
+                    chunk_need = 0;
+                }
+            }
+        }
+
+        if (!chunked && content_length >= 0 && total_written >= (size_t)content_length) {
+            break;
+        }
+        if (chunked && chunk_done) break;
+    }
+
+    (void)mbedtls_ssl_close_notify(&ssl);
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_ssl_free(&ssl);
+    (void)eyn_sys_net_tcp_close();
+
+    if (chunked && !chunk_done) {
+        puts("install: incomplete chunked transfer");
+        return -1;
+    }
+
+    *out_bytes = total_written;
+    return 0;
+}
+
+static int pkg_http_get_stream_once(const char* url,
+                                    pkg_body_writer_fn writer,
+                                    void* writer_ctx,
+                                    size_t* out_bytes,
+                                    char* out_redirect_url,
+                                    size_t out_redirect_url_cap) {
     if (!url || !writer || !out_bytes) return -1;
 
     pkg_http_url_t parts;
@@ -390,16 +1019,33 @@ static int pkg_http_get_stream(const char* url,
         return -1;
     }
 
-    uint8_t dst_ip[4];
-    if (pkg_parse_ipv4_str(parts.host, dst_ip) != 0) {
-        if (eyn_sys_net_dns_resolve(parts.host, dst_ip) != 0) {
-            printf("install: DNS failed for %s\n", parts.host);
-            return -1;
+    if (parts.is_https) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            int rc = pkg_https_get_stream_once(url,
+                                               &parts,
+                                               writer,
+                                               writer_ctx,
+                                               out_bytes,
+                                               out_redirect_url,
+                                               out_redirect_url_cap);
+            if (rc >= 0) {
+                return rc;
+            }
+
+            if (attempt == 0) {
+                puts("install: retrying HTTPS request after timeout/failure");
+            }
         }
+        return -1;
     }
 
-    if (eyn_sys_net_tcp_connect(dst_ip, parts.port, 0) != 0) {
-        printf("install: TCP connect failed for %s:%u\n", parts.host, (unsigned)parts.port);
+    uint8_t dst_ip[4];
+    if (pkg_resolve_host_ipv4(parts.host, dst_ip) != 0) return -1;
+
+    uint16_t connect_port = parts.port;
+
+    if (eyn_sys_net_tcp_connect(dst_ip, connect_port, 0) != 0) {
+        printf("install: TCP connect failed for %s:%u\n", parts.host, (unsigned)connect_port);
         return -1;
     }
 
@@ -484,6 +1130,33 @@ static int pkg_http_get_stream(const char* url,
             header_done = 1;
 
             status = pkg_parse_status_code(header);
+            if (pkg_is_redirect_status(status)) {
+                char location[MAX_URL];
+                location[0] = '\0';
+                if (pkg_header_get_value(header,
+                                         "Location",
+                                         location,
+                                         sizeof(location)) != 0
+                    || location[0] == '\0') {
+                    printf("install: HTTP status %d with missing Location for %s\n", status, url);
+                    (void)eyn_sys_net_tcp_close();
+                    return -1;
+                }
+
+                if (!out_redirect_url || out_redirect_url_cap == 0
+                    || pkg_make_redirect_url(&parts,
+                                             location,
+                                             out_redirect_url,
+                                             out_redirect_url_cap) != 0) {
+                    puts("install: redirect URL is too long");
+                    (void)eyn_sys_net_tcp_close();
+                    return -1;
+                }
+
+                (void)eyn_sys_net_tcp_close();
+                return 1;
+            }
+
             if (status != 200 && status != 206) {
                 printf("install: HTTP status %d for %s\n", status, url);
                 (void)eyn_sys_net_tcp_close();
@@ -612,6 +1285,41 @@ static int pkg_http_get_stream(const char* url,
     return 0;
 }
 
+static int pkg_http_get_stream(const char* url,
+                               pkg_body_writer_fn writer,
+                               void* writer_ctx,
+                               size_t* out_bytes) {
+    if (!url || !writer || !out_bytes) return -1;
+
+    char current_url[MAX_URL];
+    strncpy(current_url, url, sizeof(current_url) - 1);
+    current_url[sizeof(current_url) - 1] = '\0';
+
+    for (int redirects = 0; redirects <= PKG_HTTP_MAX_REDIRECTS; redirects++) {
+        char redirect_url[MAX_URL];
+        redirect_url[0] = '\0';
+
+        int rc = pkg_http_get_stream_once(current_url,
+                                          writer,
+                                          writer_ctx,
+                                          out_bytes,
+                                          redirect_url,
+                                          sizeof(redirect_url));
+        if (rc == 0) {
+            return 0;
+        }
+        if (rc < 0) {
+            return -1;
+        }
+
+        strncpy(current_url, redirect_url, sizeof(current_url) - 1);
+        current_url[sizeof(current_url) - 1] = '\0';
+    }
+
+    puts("install: too many redirects");
+    return -1;
+}
+
 typedef struct {
     uint8_t* data;
     size_t len;
@@ -623,7 +1331,7 @@ static int pkg_mem_sink_write(const uint8_t* data, size_t len, void* ctx) {
     pkg_mem_sink_t* sink = (pkg_mem_sink_t*)ctx;
     if (!sink || !data) return -1;
 
-    if (sink->len + len > sink->max_bytes) {
+    if (len > sink->max_bytes || sink->len > sink->max_bytes - len) {
         puts("install: download exceeded max allowed size");
         return -1;
     }
@@ -633,10 +1341,16 @@ static int pkg_mem_sink_write(const uint8_t* data, size_t len, void* ctx) {
         size_t next = sink->cap * 2;
         if (next < needed) next = needed;
         if (next > sink->max_bytes) next = sink->max_bytes;
-        if (next < needed) return -1;
+        if (next < needed) {
+            puts("install: download buffer limit reached");
+            return -1;
+        }
 
         uint8_t* bigger = (uint8_t*)realloc(sink->data, next + 1);
-        if (!bigger) return -1;
+        if (!bigger) {
+            puts("install: out of memory buffering download");
+            return -1;
+        }
 
         sink->data = bigger;
         sink->cap = next;
@@ -657,10 +1371,14 @@ int package_download_url_to_buffer(const char* url,
         max_bytes = PKG_DOWNLOAD_DEFAULT_MAX;
     }
 
+    size_t initial_cap = 32768u;
+    if (initial_cap > max_bytes) initial_cap = max_bytes;
+    if (initial_cap < 4096u) initial_cap = max_bytes;
+
     pkg_mem_sink_t sink;
-    sink.data = (uint8_t*)malloc(4097);
+    sink.data = (uint8_t*)malloc(initial_cap + 1u);
     sink.len = 0;
-    sink.cap = 4096;
+    sink.cap = initial_cap;
     sink.max_bytes = max_bytes;
     if (!sink.data) return -1;
 

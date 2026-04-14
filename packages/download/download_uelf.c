@@ -7,8 +7,11 @@
 #include <eynos_cmdmeta.h>
 #include <eynos_syscall.h>
 
-EYN_CMDMETA_V1("Download a file over HTTP/1.1 (GET only) with DNS support.",
-               "download http://example.com/index.html");
+#include "mbedtls/ssl.h"
+#include "mbedtls/error.h"
+
+EYN_CMDMETA_V1("Download a file over HTTP/1.1 or HTTPS/TLS (GET only) with DNS support.",
+               "download https://example.com/index.html");
 
 #define DOWNLOAD_MAX_URL 256
 #define DOWNLOAD_MAX_HOST 128
@@ -16,6 +19,9 @@ EYN_CMDMETA_V1("Download a file over HTTP/1.1 (GET only) with DNS support.",
 #define DOWNLOAD_MAX_HEADER 2048
 #define DOWNLOAD_MAX_REDIRECTS 5
 #define DOWNLOAD_TCP_RECV_BUF 1536
+#define DOWNLOAD_DNS_FALLBACK_HOST "eynos.duckdns.org"
+#define DOWNLOAD_DNS_FALLBACK_IP "192.168.1.200"
+#define DOWNLOAD_DNS_FALLBACK_IP_ALT "10.0.2.2"
 
 static int parse_ipv4_str(const char* s, uint8_t out[4]) {
     if (!s || !out) return -1;
@@ -36,19 +42,79 @@ static int parse_ipv4_str(const char* s, uint8_t out[4]) {
     return (*s == '\0') ? 0 : -1;
 }
 
+static int host_equals_ci(const char* a, const char* b) {
+    if (!a || !b) return 0;
+
+    while (*a && *b) {
+        char ca = *a;
+        char cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+        a++;
+        b++;
+    }
+
+    return *a == '\0' && *b == '\0';
+}
+
+static int ipv4_equal(const uint8_t a[4], const uint8_t b[4]) {
+    if (!a || !b) return 0;
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static int resolve_host_ipv4(const char* host, uint8_t out[4]) {
+    if (!host || !out) return -1;
+
+    if (host_equals_ci(host, DOWNLOAD_DNS_FALLBACK_HOST)
+        && parse_ipv4_str(DOWNLOAD_DNS_FALLBACK_IP, out) == 0) {
+        printf("download: using pinned fallback IP %s for %s\n",
+               DOWNLOAD_DNS_FALLBACK_IP,
+               host);
+        return 0;
+    }
+
+    if (parse_ipv4_str(host, out) == 0) return 0;
+    if (eyn_sys_net_dns_resolve(host, out) == 0) return 0;
+
+    if (host_equals_ci(host, DOWNLOAD_DNS_FALLBACK_HOST)
+        && parse_ipv4_str(DOWNLOAD_DNS_FALLBACK_IP, out) == 0) {
+        printf("download: DNS failed for %s, using fallback IP %s\n", host, DOWNLOAD_DNS_FALLBACK_IP);
+        return 0;
+    }
+
+    printf("download: DNS failed for %s\n", host);
+    return -1;
+}
+
 typedef struct {
     char host[DOWNLOAD_MAX_HOST];
     char path[DOWNLOAD_MAX_PATH];
     uint16_t port;
+    uint8_t is_https;
 } http_url_t;
+
+typedef struct {
+    uint8_t rx_buf[DOWNLOAD_TCP_RECV_BUF];
+    size_t rx_off;
+    size_t rx_len;
+} tls_io_ctx_t;
 
 static int parse_http_url(const char* url, http_url_t* out) {
     if (!url || !out) return -1;
-    const char* prefix = "http://";
-    size_t prefix_len = strlen(prefix);
-    if (strncmp(url, prefix, prefix_len) != 0) return -2;
+    const char* p = NULL;
+    if (strncmp(url, "http://", 7) == 0) {
+        out->is_https = 0;
+        out->port = 80;
+        p = url + 7;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        out->is_https = 1;
+        out->port = 443;
+        p = url + 8;
+    } else {
+        return -2;
+    }
 
-    const char* p = url + prefix_len;
     const char* host_start = p;
     while (*p && *p != '/' && *p != ':') p++;
     size_t host_len = (size_t)(p - host_start);
@@ -56,7 +122,6 @@ static int parse_http_url(const char* url, http_url_t* out) {
     memcpy(out->host, host_start, host_len);
     out->host[host_len] = '\0';
 
-    out->port = 80;
     if (*p == ':') {
         p++;
         int port = 0;
@@ -83,7 +148,8 @@ static int parse_http_url(const char* url, http_url_t* out) {
 }
 
 static int is_url_absolute(const char* s) {
-    return (s && strncmp(s, "http://", 7) == 0);
+    if (!s) return 0;
+    return strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0;
 }
 
 static int make_redirect_url(const http_url_t* base, const char* location,
@@ -114,12 +180,14 @@ static int make_redirect_url(const http_url_t* base, const char* location,
         strcat(path, location);
     }
 
+    uint16_t default_port = base->is_https ? 443 : 80;
     char port_suffix[16] = {0};
-    if (base->port != 80) {
+    if (base->port != default_port) {
         snprintf(port_suffix, sizeof(port_suffix), ":%u", (unsigned)base->port);
     }
 
-    int needed = snprintf(out, out_cap, "http://%s%s%s", base->host, port_suffix, path);
+    const char* scheme = base->is_https ? "https://" : "http://";
+    int needed = snprintf(out, out_cap, "%s%s%s%s", scheme, base->host, port_suffix, path);
     return (needed < 0 || (size_t)needed >= out_cap) ? -4 : 0;
 }
 
@@ -233,22 +301,227 @@ static int tcp_send_all(const void* buf, size_t len) {
     return 0;
 }
 
+static int tls_rng(void* ctx, unsigned char* out, size_t len) {
+    (void)ctx;
+
+    static uint32_t s = 0;
+    if (s == 0) {
+        s = (uint32_t)eyn_syscall0(EYN_SYSCALL_GET_TICKS_MS) ^ 0x5f137d6bu;
+        if (s == 0) s = 1;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        out[i] = (unsigned char)(s & 0xffu);
+    }
+
+    return 0;
+}
+
+static int tls_send_cb(void* ctx, const unsigned char* buf, size_t len) {
+    (void)ctx;
+    if (!buf || len == 0) return 0;
+
+    size_t chunk = len;
+    if (chunk > 512) chunk = 512;
+
+    int rc = eyn_sys_net_tcp_send(buf, (uint32_t)chunk);
+    if (rc < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    if (rc == 0) return MBEDTLS_ERR_SSL_WANT_WRITE;
+    return rc;
+}
+
+static int tls_recv_cb(void* ctx, unsigned char* buf, size_t len) {
+    tls_io_ctx_t* io = (tls_io_ctx_t*)ctx;
+    if (!buf || len == 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+
+    if (!io) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+
+    if (io->rx_off < io->rx_len) {
+        size_t avail = io->rx_len - io->rx_off;
+        size_t take = (len < avail) ? len : avail;
+        memcpy(buf, io->rx_buf + io->rx_off, take);
+        io->rx_off += take;
+        if (io->rx_off == io->rx_len) {
+            io->rx_off = 0;
+            io->rx_len = 0;
+        }
+        return (int)take;
+    }
+
+    int rc = eyn_sys_net_tcp_recv(io->rx_buf, (uint32_t)sizeof(io->rx_buf));
+    if (rc > 0) {
+        io->rx_off = 0;
+        io->rx_len = (size_t)rc;
+
+        size_t take = (len < io->rx_len) ? len : io->rx_len;
+        memcpy(buf, io->rx_buf, take);
+        io->rx_off = take;
+        if (io->rx_off == io->rx_len) {
+            io->rx_off = 0;
+            io->rx_len = 0;
+        }
+        return (int)take;
+    }
+    if (rc == 0) return MBEDTLS_ERR_SSL_WANT_READ;
+    if (rc == -2) return MBEDTLS_ERR_SSL_CONN_EOF;
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+}
+
+static int tls_connect_handshake(const http_url_t* parts,
+                                 const uint8_t ip[4],
+                                 mbedtls_ssl_context* ssl,
+                                 mbedtls_ssl_config* conf,
+                                 tls_io_ctx_t* io_ctx) {
+    if (!parts || !ip || !ssl || !conf || !io_ctx) return -1;
+
+    if (eyn_sys_net_tcp_connect(ip, parts->port, 0) != 0) {
+        printf("download: TCP connect failed for %s:%u via %u.%u.%u.%u\n",
+               parts->host,
+               (unsigned)parts->port,
+               (unsigned)ip[0],
+               (unsigned)ip[1],
+               (unsigned)ip[2],
+               (unsigned)ip[3]);
+        return -1;
+    }
+
+    mbedtls_ssl_init(ssl);
+    mbedtls_ssl_config_init(conf);
+
+    int rc = mbedtls_ssl_config_defaults(conf,
+                                         MBEDTLS_SSL_IS_CLIENT,
+                                         MBEDTLS_SSL_TRANSPORT_STREAM,
+                                         MBEDTLS_SSL_PRESET_DEFAULT);
+    if (rc != 0) {
+        printf("download: TLS config failed (code %d)\n", rc);
+        mbedtls_ssl_config_free(conf);
+        mbedtls_ssl_free(ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    mbedtls_ssl_conf_authmode(conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(conf, tls_rng, NULL);
+
+    rc = mbedtls_ssl_conf_max_frag_len(conf, MBEDTLS_SSL_MAX_FRAG_LEN_512);
+    if (rc != 0) {
+        printf("download: TLS max fragment config failed (code %d)\n", rc);
+    }
+
+    rc = mbedtls_ssl_setup(ssl, conf);
+    if (rc != 0) {
+        printf("download: TLS setup failed (code %d)\n", rc);
+        mbedtls_ssl_config_free(conf);
+        mbedtls_ssl_free(ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    rc = mbedtls_ssl_set_hostname(ssl, parts->host);
+    if (rc != 0) {
+        printf("download: TLS SNI set failed for %s (code %d)\n",
+               parts->host,
+               rc);
+        mbedtls_ssl_config_free(conf);
+        mbedtls_ssl_free(ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    io_ctx->rx_off = 0;
+    io_ctx->rx_len = 0;
+    mbedtls_ssl_set_bio(ssl, io_ctx, tls_send_cb, tls_recv_cb, NULL);
+
+    int handshake_polls = 0;
+    for (;;) {
+        rc = mbedtls_ssl_handshake(ssl);
+        if (rc == 0) {
+            break;
+        }
+
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            handshake_polls++;
+            if (handshake_polls >= 1500) {
+                printf("download: TLS handshake timeout via %u.%u.%u.%u\n",
+                       (unsigned)ip[0],
+                       (unsigned)ip[1],
+                       (unsigned)ip[2],
+                       (unsigned)ip[3]);
+                mbedtls_ssl_config_free(conf);
+                mbedtls_ssl_free(ssl);
+                (void)eyn_sys_net_tcp_close();
+                return -1;
+            }
+            usleep(10000);
+            continue;
+        }
+
+        printf("download: TLS handshake failed (code %d) via %u.%u.%u.%u\n",
+               rc,
+               (unsigned)ip[0],
+               (unsigned)ip[1],
+               (unsigned)ip[2],
+               (unsigned)ip[3]);
+        mbedtls_ssl_config_free(conf);
+        mbedtls_ssl_free(ssl);
+        (void)eyn_sys_net_tcp_close();
+        return -1;
+    }
+
+    return 0;
+}
+
 static int read_http_response(const char* url, const http_url_t* parts,
                               const char* out_path_hint, char* out_path,
                               size_t out_path_cap, char* out_url,
                               size_t out_url_cap) {
     (void)url;
+    int use_tls = parts->is_https ? 1 : 0;
+
     uint8_t dst_ip[4];
-    if (parse_ipv4_str(parts->host, dst_ip) != 0) {
-        if (eyn_sys_net_dns_resolve(parts->host, dst_ip) != 0) {
-            printf("download: DNS failed for %s\n", parts->host);
+    if (resolve_host_ipv4(parts->host, dst_ip) != 0) return -1;
+
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    tls_io_ctx_t tls_io;
+    int tls_ready = 0;
+
+    if (use_tls) {
+        uint8_t primary_fallback_ip[4];
+        uint8_t alt_fallback_ip[4];
+        int can_retry_alt = 0;
+
+        if (host_equals_ci(parts->host, DOWNLOAD_DNS_FALLBACK_HOST) &&
+            parse_ipv4_str(DOWNLOAD_DNS_FALLBACK_IP, primary_fallback_ip) == 0 &&
+            parse_ipv4_str(DOWNLOAD_DNS_FALLBACK_IP_ALT, alt_fallback_ip) == 0 &&
+            ipv4_equal(dst_ip, primary_fallback_ip)) {
+            can_retry_alt = 1;
+        }
+
+        if (tls_connect_handshake(parts, dst_ip, &ssl, &conf, &tls_io) != 0) {
+            if (!can_retry_alt) {
+                return -1;
+            }
+
+            printf("download: retrying TLS via alternate fallback IP %s\n",
+                   DOWNLOAD_DNS_FALLBACK_IP_ALT);
+
+            if (tls_connect_handshake(parts, alt_fallback_ip, &ssl, &conf, &tls_io) != 0) {
+                return -1;
+            }
+        }
+
+        tls_ready = 1;
+    } else {
+        mbedtls_ssl_init(&ssl);
+        mbedtls_ssl_config_init(&conf);
+        if (eyn_sys_net_tcp_connect(dst_ip, parts->port, 0) != 0) {
+            puts("download: TCP connect failed");
             return -1;
         }
-    }
-
-    if (eyn_sys_net_tcp_connect(dst_ip, parts->port, 0) != 0) {
-        puts("download: TCP connect failed");
-        return -1;
     }
 
     char req[512];
@@ -259,14 +532,44 @@ static int read_http_response(const char* url, const http_url_t* parts,
                            "Connection: close\r\n\r\n",
                            parts->path, parts->host);
     if (req_len <= 0 || req_len >= (int)sizeof(req)) {
-        eyn_sys_net_tcp_close();
+        if (tls_ready) (void)mbedtls_ssl_close_notify(&ssl);
+        mbedtls_ssl_config_free(&conf);
+        mbedtls_ssl_free(&ssl);
+        (void)eyn_sys_net_tcp_close();
         puts("download: request too large");
         return -1;
     }
-    if (tcp_send_all(req, (size_t)req_len) != 0) {
-        eyn_sys_net_tcp_close();
-        puts("download: request send failed");
-        return -1;
+
+    if (use_tls) {
+        size_t sent = 0;
+        while (sent < (size_t)req_len) {
+            int rc = mbedtls_ssl_write(&ssl,
+                                       (const unsigned char*)req + sent,
+                                       (size_t)req_len - sent);
+            if (rc > 0) {
+                sent += (size_t)rc;
+                continue;
+            }
+            if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                usleep(1000);
+                continue;
+            }
+
+            printf("download: HTTPS send failed (%d)\n", rc);
+            if (tls_ready) (void)mbedtls_ssl_close_notify(&ssl);
+            mbedtls_ssl_config_free(&conf);
+            mbedtls_ssl_free(&ssl);
+            (void)eyn_sys_net_tcp_close();
+            return -1;
+        }
+    } else {
+        if (tcp_send_all(req, (size_t)req_len) != 0) {
+            puts("download: request send failed");
+            mbedtls_ssl_config_free(&conf);
+            mbedtls_ssl_free(&ssl);
+            (void)eyn_sys_net_tcp_close();
+            return -1;
+        }
     }
 
     char header[DOWNLOAD_MAX_HEADER];
@@ -290,7 +593,21 @@ static int read_http_response(const char* url, const http_url_t* parts,
 
     while (1) {
         uint8_t rx_buf[DOWNLOAD_TCP_RECV_BUF];
-        int rc = eyn_sys_net_tcp_recv(rx_buf, sizeof(rx_buf));
+        int rc;
+        if (use_tls) {
+            rc = mbedtls_ssl_read(&ssl, rx_buf, sizeof(rx_buf));
+            if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                rc = 0;
+            } else if (rc == MBEDTLS_ERR_SSL_CONN_EOF || rc == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                rc = -2;
+            } else if (rc < 0) {
+                printf("download: HTTPS recv failed (%d)\n", rc);
+                break;
+            }
+        } else {
+            rc = eyn_sys_net_tcp_recv(rx_buf, sizeof(rx_buf));
+        }
+
         if (rc == -2) break;
         if (rc < 0) {
             puts("download: recv error");
@@ -333,9 +650,12 @@ static int read_http_response(const char* url, const http_url_t* parts,
                 if (content_length < 0) content_length = -1;
             }
 
-            if ((status == 301 || status == 302) &&
+            if ((status == 301 || status == 302 || status == 303 || status == 307 || status == 308) &&
                 header_get_value(header, "Location", location, sizeof(location)) == 0) {
-                eyn_sys_net_tcp_close();
+                if (tls_ready) (void)mbedtls_ssl_close_notify(&ssl);
+                mbedtls_ssl_config_free(&conf);
+                mbedtls_ssl_free(&ssl);
+                (void)eyn_sys_net_tcp_close();
                 if (make_redirect_url(parts, location, out_url, out_url_cap) != 0) {
                     puts("download: redirect URL too long");
                     return -1;
@@ -454,6 +774,13 @@ static int read_http_response(const char* url, const http_url_t* parts,
     if (stream_handle >= 0) {
         (void)eynfs_stream_end(stream_handle);
     }
+
+    if (tls_ready) {
+        (void)mbedtls_ssl_close_notify(&ssl);
+    }
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_ssl_free(&ssl);
+
     (void)eyn_sys_net_tcp_close();
 
     if (out_path[0] == '\0') return -1;
@@ -466,7 +793,7 @@ static int read_http_response(const char* url, const http_url_t* parts,
 
 int main(int argc, char** argv) {
     if (argc < 2 || !argv[1]) {
-        puts("Usage: download <http://url> [out_path]");
+        puts("Usage: download <http://url|https://url> [out_path]");
         return 1;
     }
 
@@ -480,7 +807,7 @@ int main(int argc, char** argv) {
     for (int redirects = 0; redirects <= DOWNLOAD_MAX_REDIRECTS; redirects++) {
         http_url_t parts;
         if (parse_http_url(url, &parts) != 0) {
-            puts("download: invalid URL (use http://host[:port]/path)");
+            puts("download: invalid URL (use http://host[:port]/path or https://host[:port]/path)");
             return 1;
         }
 

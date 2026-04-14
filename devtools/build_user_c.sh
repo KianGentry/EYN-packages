@@ -13,6 +13,9 @@ mkdir -p "$tmp_root"
 pkg_dir="$(cd "$(dirname "$src")" && pwd)"
 pkg_include_dir="$pkg_dir/include"
 pkg_src_dir="$pkg_dir/src"
+shared_mbedtls_dir="$repo_root/shared/mbedtls"
+shared_mbedtls_sources_file="$shared_mbedtls_dir/sources.list"
+use_shared_mbedtls=0
 
 ldscript="devtools/user_elf32.ld"
 crt0="userland/crt0.S"
@@ -76,6 +79,20 @@ if [ -d "$pkg_src_dir" ]; then
   CFLAGS+=( -I"$pkg_src_dir" )
 fi
 
+scan_sources=( "$src" )
+if [ -d "$pkg_src_dir" ]; then
+  while IFS= read -r scan_src; do
+    scan_sources+=( "$scan_src" )
+  done < <(find "$pkg_src_dir" -type f -name '*.c' | sort)
+fi
+
+if [ -d "$shared_mbedtls_dir" ]; then
+  if grep -E -q '["<]mbedtls/' "${scan_sources[@]}"; then
+    use_shared_mbedtls=1
+    CFLAGS+=( -I"$repo_root/shared" )
+  fi
+fi
+
 # Validate that gcc supports -m32 when not using a cross toolchain.
 if [[ "$CC" == "gcc" ]]; then
   if ! echo "int x;" | gcc -m32 -x c -c -o /dev/null - >/dev/null 2>&1; then
@@ -114,6 +131,34 @@ if [ -d "$pkg_src_dir" ]; then
     extra_objs+=( "$extra_obj" )
     extra_idx=$((extra_idx + 1))
   done < <(find "$pkg_src_dir" -type f -name '*.c' | sort)
+fi
+
+if [ "$use_shared_mbedtls" -eq 1 ]; then
+  shared_idx=0
+  if [ -f "$shared_mbedtls_sources_file" ]; then
+    while IFS= read -r rel_src; do
+      rel_src="${rel_src#./}"
+      case "$rel_src" in
+        ""|\#*) continue ;;
+      esac
+      shared_src="$shared_mbedtls_dir/$rel_src"
+      if [ ! -f "$shared_src" ]; then
+        echo "Missing shared mbedTLS source listed in sources.list: $rel_src" >&2
+        exit 1
+      fi
+      shared_obj="$tmp_root/user_shared_${shared_idx}.o"
+      "$CC" "${CFLAGS[@]}" -c "$shared_src" -o "$shared_obj"
+      extra_objs+=( "$shared_obj" )
+      shared_idx=$((shared_idx + 1))
+    done < "$shared_mbedtls_sources_file"
+  else
+    while IFS= read -r shared_src; do
+      shared_obj="$tmp_root/user_shared_${shared_idx}.o"
+      "$CC" "${CFLAGS[@]}" -c "$shared_src" -o "$shared_obj"
+      extra_objs+=( "$shared_obj" )
+      shared_idx=$((shared_idx + 1))
+    done < <(find "$shared_mbedtls_dir" -type f -name '*.c' | sort)
+  fi
 fi
 
 # Link a simple ELF32 ET_EXEC at 0x00400000.
