@@ -14,6 +14,7 @@ typedef struct PackageIndex {
 } PackageIndex;
 
 int index_fetch_and_parse(PackageIndex* out_index);
+int index_fetch_and_parse_network(PackageIndex* out_index);
 const Package* index_find_package(const PackageIndex* index, const char* name);
 int index_has_package(const PackageIndex* index, const char* name);
 

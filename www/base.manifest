@@ -9,7 +9,6 @@ clear
 clearbg
 copy
 crashlog
-create
 del
 deldir
 delete
@@ -54,6 +53,7 @@ msync
 munmap
 netcfg
 netstat
+notify
 pagingguards
 panic
 pciscan
@@ -79,7 +79,6 @@ sort
 spam
 stats
 tail
-tetris
 theme
 tiling
 title

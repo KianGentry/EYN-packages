@@ -19,9 +19,6 @@ EYN_CMDMETA_V1("Download a file over HTTP/1.1 or HTTPS/TLS (GET only) with DNS s
 #define DOWNLOAD_MAX_HEADER 2048
 #define DOWNLOAD_MAX_REDIRECTS 5
 #define DOWNLOAD_TCP_RECV_BUF 1536
-#define DOWNLOAD_DNS_FALLBACK_HOST "eynos.duckdns.org"
-#define DOWNLOAD_DNS_FALLBACK_IP "192.168.1.200"
-#define DOWNLOAD_DNS_FALLBACK_IP_ALT "10.0.2.2"
 
 static int parse_ipv4_str(const char* s, uint8_t out[4]) {
     if (!s || !out) return -1;
@@ -42,46 +39,11 @@ static int parse_ipv4_str(const char* s, uint8_t out[4]) {
     return (*s == '\0') ? 0 : -1;
 }
 
-static int host_equals_ci(const char* a, const char* b) {
-    if (!a || !b) return 0;
-
-    while (*a && *b) {
-        char ca = *a;
-        char cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
-        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
-        if (ca != cb) return 0;
-        a++;
-        b++;
-    }
-
-    return *a == '\0' && *b == '\0';
-}
-
-static int ipv4_equal(const uint8_t a[4], const uint8_t b[4]) {
-    if (!a || !b) return 0;
-    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
-}
-
 static int resolve_host_ipv4(const char* host, uint8_t out[4]) {
     if (!host || !out) return -1;
 
-    if (host_equals_ci(host, DOWNLOAD_DNS_FALLBACK_HOST)
-        && parse_ipv4_str(DOWNLOAD_DNS_FALLBACK_IP, out) == 0) {
-        printf("download: using pinned fallback IP %s for %s\n",
-               DOWNLOAD_DNS_FALLBACK_IP,
-               host);
-        return 0;
-    }
-
     if (parse_ipv4_str(host, out) == 0) return 0;
     if (eyn_sys_net_dns_resolve(host, out) == 0) return 0;
-
-    if (host_equals_ci(host, DOWNLOAD_DNS_FALLBACK_HOST)
-        && parse_ipv4_str(DOWNLOAD_DNS_FALLBACK_IP, out) == 0) {
-        printf("download: DNS failed for %s, using fallback IP %s\n", host, DOWNLOAD_DNS_FALLBACK_IP);
-        return 0;
-    }
 
     printf("download: DNS failed for %s\n", host);
     return -1;
@@ -406,11 +368,6 @@ static int tls_connect_handshake(const http_url_t* parts,
     mbedtls_ssl_conf_authmode(conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(conf, tls_rng, NULL);
 
-    rc = mbedtls_ssl_conf_max_frag_len(conf, MBEDTLS_SSL_MAX_FRAG_LEN_512);
-    if (rc != 0) {
-        printf("download: TLS max fragment config failed (code %d)\n", rc);
-    }
-
     rc = mbedtls_ssl_setup(ssl, conf);
     if (rc != 0) {
         printf("download: TLS setup failed (code %d)\n", rc);
@@ -490,29 +447,7 @@ static int read_http_response(const char* url, const http_url_t* parts,
     int tls_ready = 0;
 
     if (use_tls) {
-        uint8_t primary_fallback_ip[4];
-        uint8_t alt_fallback_ip[4];
-        int can_retry_alt = 0;
-
-        if (host_equals_ci(parts->host, DOWNLOAD_DNS_FALLBACK_HOST) &&
-            parse_ipv4_str(DOWNLOAD_DNS_FALLBACK_IP, primary_fallback_ip) == 0 &&
-            parse_ipv4_str(DOWNLOAD_DNS_FALLBACK_IP_ALT, alt_fallback_ip) == 0 &&
-            ipv4_equal(dst_ip, primary_fallback_ip)) {
-            can_retry_alt = 1;
-        }
-
-        if (tls_connect_handshake(parts, dst_ip, &ssl, &conf, &tls_io) != 0) {
-            if (!can_retry_alt) {
-                return -1;
-            }
-
-            printf("download: retrying TLS via alternate fallback IP %s\n",
-                   DOWNLOAD_DNS_FALLBACK_IP_ALT);
-
-            if (tls_connect_handshake(parts, alt_fallback_ip, &ssl, &conf, &tls_io) != 0) {
-                return -1;
-            }
-        }
+        if (tls_connect_handshake(parts, dst_ip, &ssl, &conf, &tls_io) != 0) return -1;
 
         tls_ready = 1;
     } else {

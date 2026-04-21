@@ -240,6 +240,28 @@ static int idx_skip_literal(idx_json_parser_t* parser, const char* text) {
     return 0;
 }
 
+static int idx_parse_bool(idx_json_parser_t* parser, int* out_value) {
+    if (!out_value) return -1;
+
+    idx_skip_ws(parser);
+    if (parser->len - parser->pos >= 4
+        && memcmp(parser->data + parser->pos, "true", 4) == 0) {
+        parser->pos += 4;
+        *out_value = 1;
+        return 0;
+    }
+
+    if (parser->len - parser->pos >= 5
+        && memcmp(parser->data + parser->pos, "false", 5) == 0) {
+        parser->pos += 5;
+        *out_value = 0;
+        return 0;
+    }
+
+    idx_parser_fail(parser, "expected boolean");
+    return -1;
+}
+
 static int idx_skip_value(idx_json_parser_t* parser, int depth);
 
 static int idx_skip_array(idx_json_parser_t* parser, int depth) {
@@ -450,6 +472,10 @@ static int idx_parse_release_object(idx_json_parser_t* parser,
                 return -1;
             }
             has_sha = 1;
+        } else if (strcmp(key, "system") == 0) {
+            if (idx_parse_bool(parser, &out_pkg->system) != 0) {
+                return -1;
+            }
         } else if (strcmp(key, "install_dir") == 0 || strcmp(key, "target_dir") == 0) {
             if (idx_parse_string(parser, out_pkg->install_dir, sizeof(out_pkg->install_dir)) != 0) {
                 return -1;
@@ -599,6 +625,8 @@ static int idx_parse_package_object(idx_json_parser_t* parser,
         } else if (strcmp(key, "sha256") == 0) {
             if (idx_parse_string(parser, out_pkg->sha256, sizeof(out_pkg->sha256)) != 0) return -1;
             has_sha = 1;
+        } else if (strcmp(key, "system") == 0) {
+            if (idx_parse_bool(parser, &out_pkg->system) != 0) return -1;
         } else if (strcmp(key, "install_dir") == 0 || strcmp(key, "target_dir") == 0) {
             if (idx_parse_string(parser, out_pkg->install_dir, sizeof(out_pkg->install_dir)) != 0) return -1;
         } else if (strcmp(key, "install_name") == 0 || strcmp(key, "target_name") == 0) {
@@ -681,6 +709,7 @@ static int idx_parse_package_object(idx_json_parser_t* parser,
             strncpy(chosen.install_name, out_pkg->install_name, sizeof(chosen.install_name) - 1);
             chosen.install_name[sizeof(chosen.install_name) - 1] = '\0';
         }
+        chosen.system = out_pkg->system;
 
         *out_pkg = chosen;
         has_version = 1;
@@ -1055,6 +1084,26 @@ static int idx_read_file_to_buffer(const char* path,
     return 0;
 }
 
+static void idx_try_write_local_cache(const uint8_t* data, size_t len) {
+    if (!data || len == 0 || len > INDEX_MAX_JSON_BYTES) return;
+
+    int fd = open(INSTALL_LOCAL_INDEX_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0);
+    if (fd < 0) return;
+
+    size_t off = 0;
+    while (off < len) {
+        ssize_t wr = write(fd, data + off, len - off);
+        if (wr <= 0) {
+            close(fd);
+            (void)unlink(INSTALL_LOCAL_INDEX_PATH);
+            return;
+        }
+        off += (size_t)wr;
+    }
+
+    close(fd);
+}
+
 static int idx_parse_index_bytes(PackageIndex* out_index,
                                  const uint8_t* index_json,
                                  size_t index_json_len,
@@ -1160,6 +1209,39 @@ int index_has_package(const PackageIndex* index, const char* name) {
     return index_find_package(index, name) != NULL;
 }
 
+static int idx_fetch_and_parse_network_index(PackageIndex* out_index) {
+    uint8_t* index_json = NULL;
+    size_t index_json_len = 0;
+
+    printf("install: fetching package index from %s\n", INSTALL_INDEX_URL);
+    fflush(stdout);
+
+    if (package_download_url_to_buffer(INSTALL_INDEX_URL,
+                                       &index_json,
+                                       &index_json_len,
+                                       INDEX_MAX_JSON_BYTES) != 0) {
+        printf("install: failed to fetch package index from %s\n", INSTALL_INDEX_URL);
+        return -1;
+    }
+
+    int rc = idx_parse_index_bytes(out_index,
+                                   index_json,
+                                   index_json_len,
+                                   "network index");
+
+    if (rc == 0) {
+        idx_try_write_local_cache(index_json, index_json_len);
+    }
+
+    free(index_json);
+    return rc;
+}
+
+int index_fetch_and_parse_network(PackageIndex* out_index) {
+    if (!out_index) return -1;
+    return idx_fetch_and_parse_network_index(out_index);
+}
+
 int index_fetch_and_parse(PackageIndex* out_index) {
     if (!out_index) return -1;
 
@@ -1182,22 +1264,5 @@ int index_fetch_and_parse(PackageIndex* out_index) {
         free(local_index_json);
     }
 
-    uint8_t* index_json = NULL;
-    size_t index_json_len = 0;
-
-    if (package_download_url_to_buffer(INSTALL_INDEX_URL,
-                                       &index_json,
-                                       &index_json_len,
-                                       INDEX_MAX_JSON_BYTES) != 0) {
-        printf("install: failed to fetch package index from %s\n", INSTALL_INDEX_URL);
-        return -1;
-    }
-
-    int rc = idx_parse_index_bytes(out_index,
-                                   index_json,
-                                   index_json_len,
-                                   "network index");
-
-    free(index_json);
-    return rc;
+    return idx_fetch_and_parse_network_index(out_index);
 }

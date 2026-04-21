@@ -17,6 +17,7 @@ typedef struct {
     char sha256[MAX_SHA];
     char install_dir[MAX_INSTALL_DIR];
     char install_name[MAX_NAME];
+    int system;
     char deps[MAX_DEPS][MAX_NAME];
     int dep_count;
 } Package;

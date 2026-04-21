@@ -1493,7 +1493,7 @@ static void draw_ui(int h, installer_t* s) {
                  selected_fonts,
                  s->include_chibicc ? "on" : "off");
 
-        draw_center_text(h, 42, "Configure install options (menuconfig-style)", 220, 220, 220);
+        draw_center_text(h, 42, "Configure install options", 220, 220, 220);
         draw_center_text(h, 62, summary_pkgs, 180, 200, 220);
         draw_center_text(h, 80, summary_assets, 170, 190, 210);
 
