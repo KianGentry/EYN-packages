@@ -12,6 +12,12 @@ EYN_CMDMETA_V1("Open system settings (video + customization).", "settings");
 #define HEADER_H 26
 #define DBLCLICK_FRAMES 20
 
+enum {
+    BG_MODE_TILE = 0,
+    BG_MODE_SCALE = 1,
+    BG_MODE_CENTER = 2,
+};
+
 typedef struct {
     int width;
     int height;
@@ -35,6 +41,9 @@ typedef struct {
     int scale_idx;
     int aspect_idx;
     int mode_idx;
+
+    char bg_path[128];
+    int bg_mode_idx;
 
     eyn_display_profile_t profile;
     eyn_display_mode_t mode;
@@ -95,7 +104,7 @@ static void set_status(settings_state_t* st, const char* msg) {
 
 static int section_row_count(int section) {
     if (section == 0) return 6; // Video rows
-    return 4; // Customization rows
+    return 8; // Customization rows
 }
 
 static int mode_index_for_values(int width, int height, int bpp) {
@@ -135,6 +144,60 @@ static int scale_index_for_value(int value) {
 static int aspect_index_for_value(int value) {
     if (value < EYN_ASPECT_NATIVE || value > EYN_ASPECT_1_1) return EYN_ASPECT_NATIVE;
     return value;
+}
+
+static const char* bg_mode_name(int mode_idx) {
+    switch (mode_idx) {
+        case BG_MODE_TILE: return "Tile";
+        case BG_MODE_CENTER: return "Center";
+        case BG_MODE_SCALE:
+        default:
+            return "Scale";
+    }
+}
+
+static int bg_mode_value(int mode_idx) {
+    switch (mode_idx) {
+        case BG_MODE_TILE: return 1;
+        case BG_MODE_CENTER: return 3;
+        case BG_MODE_SCALE:
+        default:
+            return 2;
+    }
+}
+
+static int cycle_bg_mode(settings_state_t* st, int dir) {
+    if (!st || dir == 0) return 0;
+    int next = st->bg_mode_idx + (dir > 0 ? 1 : -1);
+    if (next < 0) next = 2;
+    if (next > 2) next = 0;
+    if (next != st->bg_mode_idx) {
+        st->bg_mode_idx = next;
+        return 1;
+    }
+    return 0;
+}
+
+static void apply_background(settings_state_t* st) {
+    if (!st) return;
+    if (!st->bg_path[0]) {
+        if (eyn_sys_clearbg_focused() == 0) {
+            set_status(st, "background cleared to dark gray fallback");
+        } else {
+            set_status(st, "background clear failed");
+        }
+        return;
+    }
+
+    if (eyn_sys_setbg_path_mode(st->bg_path, bg_mode_value(st->bg_mode_idx)) == 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "background applied: %s (%s)", st->bg_path, bg_mode_name(st->bg_mode_idx));
+        set_status(st, msg);
+    } else if (eyn_sys_clearbg_focused() == 0) {
+        set_status(st, "background load failed; using dark gray fallback");
+    } else {
+        set_status(st, "background load failed");
+    }
 }
 
 static void refresh_profile(settings_state_t* st) {
@@ -226,14 +289,22 @@ static void activate_current_row(settings_state_t* st) {
         return;
     }
 
-    if (st->row == 0) {
+    if (st->row == 0 || st->row == 1 || st->row == 2) {
+        apply_background(st);
+    } else if (st->row == 3) {
+        if (eyn_sys_clearbg_focused() == 0) {
+            set_status(st, "background cleared to dark gray fallback");
+        } else {
+            set_status(st, "background clear failed");
+        }
+    } else if (st->row == 4) {
         apply_font(st, "builtin");
-    } else if (st->row == 1) {
+    } else if (st->row == 5) {
         apply_font(st, "/fonts/unscii-16.hex");
-    } else if (st->row == 2) {
+    } else if (st->row == 6) {
         st->running = 0;
         (void)eyn_sys_run("theme");
-    } else if (st->row == 3) {
+    } else if (st->row == 7) {
         st->running = 0;
         (void)eyn_sys_run("fontpreview /fonts/unscii-16.otf");
     }
@@ -340,6 +411,37 @@ static int handle_key(settings_state_t* st, int key) {
         if (ch == 's' || ch == 'S') {
             apply_video(st, 1);
             return 1;
+        }
+    } else if (st->row == 0) {
+        if (key == 8 || key == 127) {
+            int len = (int)strlen(st->bg_path);
+            if (len > 0) {
+                st->bg_path[len - 1] = '\0';
+                return 1;
+            }
+            return 0;
+        }
+        if (key == GUI_KEY_LEFT || key == GUI_KEY_RIGHT) {
+            return 0;
+        }
+        if (ch >= 32 && ch <= 126) {
+            int len = (int)strlen(st->bg_path);
+            if (len < (int)sizeof(st->bg_path) - 1) {
+                st->bg_path[len] = (char)ch;
+                st->bg_path[len + 1] = '\0';
+                return 1;
+            }
+            set_status(st, "background path is too long");
+            return 1;
+        }
+    } else if (st->row == 1) {
+        if (key == GUI_KEY_LEFT) {
+            if (cycle_bg_mode(st, -1)) return 1;
+            return 0;
+        }
+        if (key == GUI_KEY_RIGHT) {
+            if (cycle_bg_mode(st, 1)) return 1;
+            return 0;
         }
     }
 
@@ -487,10 +589,27 @@ static void draw_section_rows(settings_state_t* st, const settings_layout_t* lo)
                 snprintf(line, sizeof(line), "Reset defaults (640x480 + native + 100%%)");
             }
         } else {
-            if (i == 0) snprintf(line, sizeof(line), "Use built-in font");
-            else if (i == 1) snprintf(line, sizeof(line), "Use /fonts/unscii-16.hex");
-            else if (i == 2) snprintf(line, sizeof(line), "Open Theme editor");
-            else snprintf(line, sizeof(line), "Open Font preview");
+            if (i == 0) {
+                if (st->bg_path[0]) {
+                    snprintf(line, sizeof(line), "Background path: %s", st->bg_path);
+                } else {
+                    snprintf(line, sizeof(line), "Background path: [type a REI or BMP path]");
+                }
+            } else if (i == 1) {
+                snprintf(line, sizeof(line), "Background mode: %s", bg_mode_name(st->bg_mode_idx));
+            } else if (i == 2) {
+                snprintf(line, sizeof(line), "Apply background now");
+            } else if (i == 3) {
+                snprintf(line, sizeof(line), "Clear background to dark gray");
+            } else if (i == 4) {
+                snprintf(line, sizeof(line), "Use built-in font");
+            } else if (i == 5) {
+                snprintf(line, sizeof(line), "Use /fonts/unscii-16.hex");
+            } else if (i == 6) {
+                snprintf(line, sizeof(line), "Open Theme editor");
+            } else {
+                snprintf(line, sizeof(line), "Open Font preview");
+            }
         }
 
         draw_text_line(st->handle, lo->list_x + 8, y + 4, GUI_PAL_TEXT_R, GUI_PAL_TEXT_G, GUI_PAL_TEXT_B, line);
@@ -576,6 +695,11 @@ static void render(settings_state_t* st) {
 
     draw_section_rows(st, &lo);
 
+    if (st->section == 1) {
+        draw_text_line(st->handle, 8, sz.h - 58, GUI_PAL_DIM_R, GUI_PAL_DIM_G, GUI_PAL_DIM_B,
+                       "Path entry is live on row 1. Use Left/Right on row 2 to cycle mode.");
+    }
+
     char info[128];
     snprintf(info, sizeof(info), "Framebuffer: %dx%dx%d | Workspace: %dx%d",
              st->mode.width, st->mode.height, st->mode.bpp,
@@ -585,7 +709,7 @@ static void render(settings_state_t* st) {
     draw_text_line(st->handle, 8, sz.h - 30, GUI_PAL_ACCENT_R, GUI_PAL_ACCENT_G, GUI_PAL_ACCENT_B, st->status);
 
     draw_text_line(st->handle, 8, sz.h - 16, GUI_PAL_DIM_R, GUI_PAL_DIM_G, GUI_PAL_DIM_B,
-                   "Mouse: click rows/tabs | Left/Right: adjust | Enter/A/S: apply | Q/Esc: quit");
+                   "Mouse: click rows/tabs | type path on custom row 1 | Left/Right: adjust | Enter/A/S: apply | Q/Esc: quit");
 
     if (!st->mode.can_switch) {
         draw_text_line(st->handle, sz.w - 240, sz.h - 30, 255, 180, 120,
@@ -608,6 +732,8 @@ int main(int argc, char** argv) {
     st.hover_section = -1;
     st.hover_row = -1;
     st.last_click_row = -1;
+    st.bg_mode_idx = BG_MODE_SCALE;
+    st.bg_path[0] = '\0';
 
     st.handle = gui_attach("Settings", "Video + customization");
     if (st.handle < 0) {

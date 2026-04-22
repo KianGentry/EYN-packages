@@ -774,6 +774,8 @@ int main(int argc, char** argv) {
     }
 
     int need_redraw = 1;
+    int last_w = -1;
+    int last_h = -1;
 
     while (app.running) {
         gui_event_t ev;
@@ -818,6 +820,17 @@ int main(int argc, char** argv) {
                     strcmp(app.path, old_path) != 0) {
                     need_redraw = 1;
                 }
+            }
+        }
+
+        gui_size_t cur_sz;
+        cur_sz.w = 0;
+        cur_sz.h = 0;
+        if (gui_get_content_size(app.handle, &cur_sz) == 0) {
+            if (cur_sz.w != last_w || cur_sz.h != last_h) {
+                last_w = cur_sz.w;
+                last_h = cur_sz.h;
+                need_redraw = 1;
             }
         }
 
