@@ -62,6 +62,7 @@ ping
 pipe
 portable
 predict
+ptyspawn
 pwd
 random
 rect
@@ -77,6 +78,7 @@ size
 snake
 sort
 spam
+ssh
 stats
 tail
 theme

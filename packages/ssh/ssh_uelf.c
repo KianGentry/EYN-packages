@@ -10,11 +10,31 @@
 EYN_CMDMETA_V1("SSH client scaffold with banner+KEX smoke and PTY spawn smoke.",
                "ssh user@192.168.1.10");
 
+// Compatibility declaration in case an older userland header is picked up.
+int spawn_ex(const char* path,
+             const char* const* argv,
+             int argc,
+             int stdin_fd,
+             int stdout_fd,
+             int stderr_fd,
+             int inherit_mode);
+
+#ifndef WNOHANG
+#define WNOHANG 1
+#endif
+
 #define SSH_MAX_TARGET 192
 #define SSH_MAX_USER   64
 #define SSH_MAX_HOST   128
 #define SSH_MAX_LINE   256
 #define SSH_MAX_PACKET 4096
+
+static const char* SSH_KEX_ALGS =
+    "diffie-hellman-group14-sha256,diffie-hellman-group14-sha1";
+static const char* SSH_HOSTKEY_ALGS = "ssh-rsa";
+static const char* SSH_CIPHER_ALGS = "aes128-ctr,aes256-ctr";
+static const char* SSH_MAC_ALGS = "hmac-sha2-256,hmac-sha1";
+static const char* SSH_COMP_ALGS = "none";
 
 typedef struct {
     char user[SSH_MAX_USER];
@@ -166,6 +186,67 @@ static uint32_t be32_read(const uint8_t in[4]) {
            (uint32_t)in[3];
 }
 
+static int be32_read_at(const uint8_t* p, int len, int off, uint32_t* out) {
+    if (!p || !out || len < 0 || off < 0 || off + 4 > len) return -1;
+    *out = ((uint32_t)p[off] << 24) |
+           ((uint32_t)p[off + 1] << 16) |
+           ((uint32_t)p[off + 2] << 8) |
+           (uint32_t)p[off + 3];
+    return 0;
+}
+
+static int parse_namelist_field(const uint8_t* p,
+                                int len,
+                                int* off_io,
+                                char* out,
+                                int out_cap) {
+    if (!p || !off_io || !out || out_cap <= 0) return -1;
+    uint32_t n = 0;
+    int off = *off_io;
+    if (be32_read_at(p, len, off, &n) != 0) return -1;
+    off += 4;
+    if ((uint32_t)len < (uint32_t)off + n) return -1;
+    if ((int)n >= out_cap) return -1;
+    if (n > 0) memcpy(out, &p[off], n);
+    out[n] = '\0';
+    off += (int)n;
+    *off_io = off;
+    return 0;
+}
+
+static int csv_has_token(const char* csv, const char* token, int token_len) {
+    if (!csv || !token || token_len <= 0) return 0;
+    const char* p = csv;
+    while (*p) {
+        const char* start = p;
+        while (*p && *p != ',') p++;
+        int len = (int)(p - start);
+        if (len == token_len && strncmp(start, token, (size_t)len) == 0) return 1;
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
+static int pick_first_common(const char* preferred_csv,
+                             const char* offered_csv,
+                             char* out,
+                             int out_cap) {
+    if (!preferred_csv || !offered_csv || !out || out_cap <= 1) return -1;
+    const char* p = preferred_csv;
+    while (*p) {
+        const char* start = p;
+        while (*p && *p != ',') p++;
+        int len = (int)(p - start);
+        if (len > 0 && len < out_cap && csv_has_token(offered_csv, start, len)) {
+            memcpy(out, start, (size_t)len);
+            out[len] = '\0';
+            return 0;
+        }
+        if (*p == ',') p++;
+    }
+    return -1;
+}
+
 static int ssh_send_packet(const uint8_t* payload, int payload_len, uint32_t seed) {
     if (!payload || payload_len <= 0 || payload_len > (SSH_MAX_PACKET - 32)) return -1;
 
@@ -233,14 +314,14 @@ static int ssh_send_kexinit(void) {
     }
 
     const char* lists[10] = {
-        "diffie-hellman-group14-sha256,diffie-hellman-group14-sha1",
-        "ssh-rsa",
-        "aes128-ctr,aes256-ctr",
-        "aes128-ctr,aes256-ctr",
-        "hmac-sha2-256,hmac-sha1",
-        "hmac-sha2-256,hmac-sha1",
-        "none",
-        "none",
+        SSH_KEX_ALGS,
+        SSH_HOSTKEY_ALGS,
+        SSH_CIPHER_ALGS,
+        SSH_CIPHER_ALGS,
+        SSH_MAC_ALGS,
+        SSH_MAC_ALGS,
+        SSH_COMP_ALGS,
+        SSH_COMP_ALGS,
         "",
         ""
     };
@@ -262,6 +343,62 @@ static int ssh_send_kexinit(void) {
     off += 4;
 
     return ssh_send_packet(payload, off, seed ^ 0x53534821u);
+}
+
+static int ssh_parse_server_kexinit(const uint8_t* payload, int payload_len) {
+    if (!payload || payload_len < 1 + 16 + 4) return -1;
+    if (payload[0] != 20) {
+        printf("ssh: expected SSH_MSG_KEXINIT (20), got %u\n", (unsigned)payload[0]);
+        return -1;
+    }
+
+    int off = 1 + 16; // msg id + cookie
+    char server_kex[256], server_hostkey[256];
+    char server_c2s_cipher[256], server_s2c_cipher[256];
+    char server_c2s_mac[256], server_s2c_mac[256];
+    char server_c2s_comp[64], server_s2c_comp[64];
+    char lang_c2s[32], lang_s2c[32];
+
+    if (parse_namelist_field(payload, payload_len, &off, server_kex, sizeof(server_kex)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, server_hostkey, sizeof(server_hostkey)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, server_c2s_cipher, sizeof(server_c2s_cipher)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, server_s2c_cipher, sizeof(server_s2c_cipher)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, server_c2s_mac, sizeof(server_c2s_mac)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, server_s2c_mac, sizeof(server_s2c_mac)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, server_c2s_comp, sizeof(server_c2s_comp)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, server_s2c_comp, sizeof(server_s2c_comp)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, lang_c2s, sizeof(lang_c2s)) != 0) return -1;
+    if (parse_namelist_field(payload, payload_len, &off, lang_s2c, sizeof(lang_s2c)) != 0) return -1;
+
+    if (off + 5 > payload_len) return -1;
+    uint8_t first_kex_follows = payload[off++];
+    uint32_t reserved = 0;
+    if (be32_read_at(payload, payload_len, off, &reserved) != 0) return -1;
+    (void)reserved;
+
+    char chosen_kex[96], chosen_hostkey[96];
+    char chosen_c2s_cipher[96], chosen_s2c_cipher[96];
+    char chosen_c2s_mac[96], chosen_s2c_mac[96];
+    char chosen_c2s_comp[32], chosen_s2c_comp[32];
+
+    if (pick_first_common(SSH_KEX_ALGS, server_kex, chosen_kex, sizeof(chosen_kex)) != 0) return -1;
+    if (pick_first_common(SSH_HOSTKEY_ALGS, server_hostkey, chosen_hostkey, sizeof(chosen_hostkey)) != 0) return -1;
+    if (pick_first_common(SSH_CIPHER_ALGS, server_c2s_cipher, chosen_c2s_cipher, sizeof(chosen_c2s_cipher)) != 0) return -1;
+    if (pick_first_common(SSH_CIPHER_ALGS, server_s2c_cipher, chosen_s2c_cipher, sizeof(chosen_s2c_cipher)) != 0) return -1;
+    if (pick_first_common(SSH_MAC_ALGS, server_c2s_mac, chosen_c2s_mac, sizeof(chosen_c2s_mac)) != 0) return -1;
+    if (pick_first_common(SSH_MAC_ALGS, server_s2c_mac, chosen_s2c_mac, sizeof(chosen_s2c_mac)) != 0) return -1;
+    if (pick_first_common(SSH_COMP_ALGS, server_c2s_comp, chosen_c2s_comp, sizeof(chosen_c2s_comp)) != 0) return -1;
+    if (pick_first_common(SSH_COMP_ALGS, server_s2c_comp, chosen_s2c_comp, sizeof(chosen_s2c_comp)) != 0) return -1;
+
+    printf("ssh: negotiated kex=%s hostkey=%s\n", chosen_kex, chosen_hostkey);
+    printf("ssh: negotiated cipher c2s=%s s2c=%s\n", chosen_c2s_cipher, chosen_s2c_cipher);
+    printf("ssh: negotiated mac    c2s=%s s2c=%s\n", chosen_c2s_mac, chosen_s2c_mac);
+    printf("ssh: negotiated comp   c2s=%s s2c=%s\n", chosen_c2s_comp, chosen_s2c_comp);
+    if (first_kex_follows) {
+        puts("ssh: server set first_kex_packet_follows=1; ignore handling not implemented yet.");
+    }
+
+    return 0;
 }
 
 static int ssh_probe_banner(const char* target_str) {
@@ -322,7 +459,12 @@ static int ssh_probe_banner(const char* target_str) {
     }
 
     printf("ssh: received packet msg=%d payload_len=%d\n", rx_msg, rx_len);
-    puts("ssh: transport+kex smoke complete; DH key exchange and NEWKEYS not implemented yet.");
+    if (ssh_parse_server_kexinit(rx_payload, rx_len) != 0) {
+        puts("ssh: failed to parse/negotiate server KEXINIT");
+        (void)eyn_sys_net_tcp_close();
+        return 1;
+    }
+    puts("ssh: KEXINIT negotiation complete; DH key exchange and NEWKEYS not implemented yet.");
 
     (void)eyn_sys_net_tcp_close();
     return 0;
