@@ -63,7 +63,7 @@ static void usage(void) {
 }
 
 int main(int argc, char** argv) {
-    const char* path = "";
+    const char* path = ".";
     if (argc >= 2) {
         if (argv[1][0] == '-' && argv[1][1] == 'h' && argv[1][2] == '\0') {
             usage();
@@ -74,9 +74,21 @@ int main(int argc, char** argv) {
             return 1;
         }
         path = argv[1];
+    } else {
+        char cwd[128];
+        if (getcwd(cwd, sizeof(cwd)) > 0 && cwd[0]) {
+            path = cwd;
+        } else {
+            path = "/";
+        }
     }
 
     int fd = open(path, O_RDONLY, 0);
+    if (fd < 0 && strcmp(path, ".") == 0) {
+        /* Some boot/runtime setups may not expose dot-path resolution yet. */
+        path = "/";
+        fd = open(path, O_RDONLY, 0);
+    }
     if (fd < 0) {
         console_set_rgb(255, 0, 0);
         printf("list: failed to open: %s\n", (path && path[0]) ? path : ".");
