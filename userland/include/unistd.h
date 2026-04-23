@@ -29,6 +29,13 @@ int fd_set_nonblock(int fd, int enabled);
 
 #define WNOHANG 1
 int spawn(const char* path, const char* const* argv, int argc);
+int spawn_ex(const char* path,
+			 const char* const* argv,
+			 int argc,
+			 int stdin_fd,
+			 int stdout_fd,
+			 int stderr_fd,
+			 int inherit_mode);
 int waitpid(int pid, int* status, int options);
 
 // Create/overwrite a file with given contents.

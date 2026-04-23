@@ -58,6 +58,26 @@ int spawn(const char* path, const char* const* argv, int argc) {
                             argc);
 }
 
+int spawn_ex(const char* path,
+             const char* const* argv,
+             int argc,
+             int stdin_fd,
+             int stdout_fd,
+             int stderr_fd,
+             int inherit_mode) {
+    if (!path || argc < 0) return -1;
+
+    eyn_spawn_ex_req_t req;
+    req.path = path;
+    req.argv = argv;
+    req.argc = argc;
+    req.stdin_fd = stdin_fd;
+    req.stdout_fd = stdout_fd;
+    req.stderr_fd = stderr_fd;
+    req.inherit_mode = inherit_mode ? 1 : 0;
+    return eyn_sys_spawn_ex(&req);
+}
+
 int waitpid(int pid, int* status, int options) {
     return eyn_syscall3_iii(EYN_SYSCALL_WAITPID,
                             pid,
