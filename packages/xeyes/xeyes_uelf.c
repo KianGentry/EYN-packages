@@ -8,9 +8,6 @@
  * Controls:
  *   - Move the mouse to make the eyes track the pointer.
  *   - Press 'q' or right-click to quit.
- *
- * Build for EYN-OS:
- *   devtools/build_user_c.sh testdir/code/xeyes_uelf.c testdir/binaries/xeyes
  */
 #include <eynos_cmdmeta.h>
 EYN_CMDMETA_V1("X11 xeyes - eyes that follow the mouse pointer", "xeyes");
