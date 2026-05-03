@@ -20,11 +20,11 @@
 #define PKG_HTTP_MAX_HOST 128
 #define PKG_HTTP_MAX_PATH 256
 #define PKG_HTTP_MAX_HEADER 4096
-#define PKG_HTTP_RECV_BUF 1536
-#define PKG_HTTP_CHUNK_BUF 4096
-#define PKG_HTTP_IDLE_RECV_LIMIT 1000
-#define PKG_HTTP_FIRST_BYTE_RECV_LIMIT 2500
-#define PKG_HTTP_HANDSHAKE_POLL_LIMIT 1000
+#define PKG_HTTP_RECV_BUF 8192
+#define PKG_HTTP_CHUNK_BUF 16384
+#define PKG_HTTP_IDLE_RECV_LIMIT 3000
+#define PKG_HTTP_FIRST_BYTE_RECV_LIMIT 4000
+#define PKG_HTTP_HANDSHAKE_POLL_LIMIT 3000
 #define PKG_HTTP_MAX_REDIRECTS 5
 #define PKG_DOWNLOAD_DEFAULT_MAX (8u * 1024u * 1024u)
 #define PKG_INSTALL_PATH_CAP 256
@@ -594,7 +594,7 @@ static int pkg_tls_send_cb(void* ctx, const unsigned char* buf, size_t len) {
     if (!buf || len == 0) return 0;
 
     size_t chunk = len;
-    if (chunk > 512) chunk = 512;
+    if (chunk > 4096) chunk = 4096;
 
     int rc = eyn_sys_net_tcp_send(buf, (uint32_t)chunk);
     if (rc < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
@@ -729,7 +729,7 @@ static int pkg_tls_connect_handshake(const pkg_http_url_t* parts,
                 (void)eyn_sys_net_tcp_close();
                 return -1;
             }
-            usleep(10000);
+            usleep(20000);
             continue;
         }
 
@@ -799,7 +799,7 @@ static int pkg_https_get_stream_once(const char* url,
             continue;
         }
         if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            usleep(1000);
+            usleep(5000);
             continue;
         }
 
@@ -846,7 +846,7 @@ static int pkg_https_get_stream_once(const char* url,
                 (void)eyn_sys_net_tcp_close();
                 return -1;
             }
-            usleep(10000);
+            usleep(20000);
             continue;
         }
 
