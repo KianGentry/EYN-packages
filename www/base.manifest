@@ -41,6 +41,7 @@ jobs
 jsonparse
 kstats
 kwin_test
+ldso
 list
 log
 lsata
