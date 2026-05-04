@@ -20,11 +20,11 @@
 #define PKG_HTTP_MAX_HOST 128
 #define PKG_HTTP_MAX_PATH 256
 #define PKG_HTTP_MAX_HEADER 4096
-#define PKG_HTTP_RECV_BUF 8192
-#define PKG_HTTP_CHUNK_BUF 16384
-#define PKG_HTTP_IDLE_RECV_LIMIT 3000
-#define PKG_HTTP_FIRST_BYTE_RECV_LIMIT 4000
-#define PKG_HTTP_HANDSHAKE_POLL_LIMIT 3000
+#define PKG_HTTP_RECV_BUF 1536
+#define PKG_HTTP_CHUNK_BUF 4096
+#define PKG_HTTP_IDLE_RECV_LIMIT 1000
+#define PKG_HTTP_FIRST_BYTE_RECV_LIMIT 2500
+#define PKG_HTTP_HANDSHAKE_POLL_LIMIT 1000
 #define PKG_HTTP_MAX_REDIRECTS 5
 #define PKG_DOWNLOAD_DEFAULT_MAX (8u * 1024u * 1024u)
 #define PKG_INSTALL_PATH_CAP 256
@@ -62,6 +62,11 @@ typedef struct {
 
 typedef int (*pkg_body_writer_fn)(const uint8_t* data, size_t len, void* ctx);
 typedef void (*pkg_progress_update_fn)(size_t downloaded, long total_bytes, void* ctx);
+
+static const mbedtls_ecp_group_id pkg_tls_curves[] = {
+    MBEDTLS_ECP_DP_SECP256R1,
+    MBEDTLS_ECP_DP_NONE,
+};
 
 typedef struct {
     uint32_t state[8];
@@ -249,6 +254,22 @@ static int pkg_resolve_host_ipv4(const char* host, uint8_t out[4]) {
 
     printf("install: DNS failed for %s\n", host);
     return -1;
+}
+
+static int pkg_parse_http_url(const char* url, pkg_http_url_t* out);
+
+static int pkg_copy_trusted_sni_host(char* out_host, size_t out_cap) {
+    if (!out_host || out_cap == 0) return -1;
+
+    pkg_http_url_t trusted;
+    if (pkg_parse_http_url(INSTALL_INDEX_URL, &trusted) != 0 || !trusted.host[0]) {
+        return -1;
+    }
+
+    if (strlen(trusted.host) >= out_cap) return -1;
+    strncpy(out_host, trusted.host, out_cap - 1);
+    out_host[out_cap - 1] = '\0';
+    return 0;
 }
 
 static int pkg_parse_http_url(const char* url, pkg_http_url_t* out) {
@@ -594,9 +615,11 @@ static int pkg_tls_send_cb(void* ctx, const unsigned char* buf, size_t len) {
     if (!buf || len == 0) return 0;
 
     size_t chunk = len;
-    if (chunk > 4096) chunk = 4096;
+    if (chunk > 512) chunk = 512;
 
     int rc = eyn_sys_net_tcp_send(buf, (uint32_t)chunk);
+    // EYN net may report transient route/unavailability as -2; let TLS retry.
+    if (rc == -2) return MBEDTLS_ERR_SSL_WANT_WRITE;
     if (rc < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
     if (rc == 0) return MBEDTLS_ERR_SSL_WANT_WRITE;
     return rc;
@@ -644,7 +667,8 @@ static int pkg_tls_connect_handshake(const pkg_http_url_t* parts,
                                      mbedtls_ssl_context* ssl,
                                      mbedtls_ssl_config* conf,
                                      pkg_tls_io_ctx_t* io_ctx,
-                                     int* out_tls_err) {
+                                     int* out_tls_err,
+                                     const char* sni_host) {
     if (!parts || !ip || !ssl || !conf || !io_ctx) return -1;
     if (out_tls_err) *out_tls_err = 0;
 
@@ -681,6 +705,7 @@ static int pkg_tls_connect_handshake(const pkg_http_url_t* parts,
 
     mbedtls_ssl_conf_authmode(conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(conf, pkg_tls_rng, NULL);
+    mbedtls_ssl_conf_curves(conf, pkg_tls_curves);
 
     rc = mbedtls_ssl_setup(ssl, conf);
     if (rc != 0) {
@@ -692,11 +717,12 @@ static int pkg_tls_connect_handshake(const pkg_http_url_t* parts,
         return -1;
     }
 
-    rc = mbedtls_ssl_set_hostname(ssl, parts->host);
+    const char* effective_sni = (sni_host && sni_host[0]) ? sni_host : parts->host;
+    rc = mbedtls_ssl_set_hostname(ssl, effective_sni);
     if (rc != 0) {
         if (out_tls_err) *out_tls_err = rc;
         printf("install: TLS SNI set failed for %s (code %d)\n",
-               parts->host,
+               effective_sni,
                rc);
         mbedtls_ssl_free(ssl);
         mbedtls_ssl_config_free(conf);
@@ -717,6 +743,9 @@ static int pkg_tls_connect_handshake(const pkg_http_url_t* parts,
 
         if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
             handshake_polls++;
+            if ((handshake_polls % 100) == 0) {
+                puts("install: waiting on TLS handshake...");
+            }
             if (handshake_polls >= PKG_HTTP_HANDSHAKE_POLL_LIMIT) {
                 if (out_tls_err) *out_tls_err = MBEDTLS_ERR_SSL_TIMEOUT;
                 printf("install: TLS handshake timeout via %u.%u.%u.%u\n",
@@ -729,7 +758,7 @@ static int pkg_tls_connect_handshake(const pkg_http_url_t* parts,
                 (void)eyn_sys_net_tcp_close();
                 return -1;
             }
-            usleep(20000);
+            usleep(10000);
             continue;
         }
 
@@ -767,7 +796,29 @@ static int pkg_https_get_stream_once(const char* url,
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     pkg_tls_io_ctx_t tls_io;
-    if (pkg_tls_connect_handshake(parts, dst_ip, &ssl, &conf, &tls_io, out_tls_err) != 0) return -1;
+
+    char trusted_sni_host[PKG_HTTP_MAX_HOST];
+    trusted_sni_host[0] = '\0';
+    int use_trusted_sni = 0;
+    if (pkg_parse_ipv4_str(parts->host, dst_ip) == 0
+        && pkg_copy_trusted_sni_host(trusted_sni_host, sizeof(trusted_sni_host)) == 0) {
+        use_trusted_sni = 1;
+    }
+
+    if (pkg_tls_connect_handshake(parts, dst_ip, &ssl, &conf, &tls_io, out_tls_err, parts->host) != 0) {
+        if (!use_trusted_sni || !out_tls_err || *out_tls_err != MBEDTLS_ERR_SSL_INTERNAL_ERROR) {
+            return -1;
+        }
+
+        printf("install: retrying TLS handshake with SNI %s for %s\n",
+               trusted_sni_host,
+               parts->host);
+        if (pkg_tls_connect_handshake(parts, dst_ip, &ssl, &conf, &tls_io, out_tls_err, trusted_sni_host) != 0) {
+            return -1;
+        }
+    }
+
+    const char* request_host = use_trusted_sni ? trusted_sni_host : parts->host;
 
     int rc = 0;
 
@@ -779,7 +830,7 @@ static int pkg_https_get_stream_once(const char* url,
                            "User-Agent: EYN-OS/install\r\n"
                            "Connection: close\r\n\r\n",
                            parts->path,
-                           parts->host);
+                           request_host);
     if (req_len <= 0 || req_len >= (int)sizeof(req)) {
         puts("install: HTTPS request too large");
         (void)mbedtls_ssl_close_notify(&ssl);
@@ -799,7 +850,7 @@ static int pkg_https_get_stream_once(const char* url,
             continue;
         }
         if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            usleep(5000);
+            usleep(1000);
             continue;
         }
 
@@ -836,6 +887,9 @@ static int pkg_https_get_stream_once(const char* url,
 
         if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
             idle_recv_polls++;
+            if (!saw_any_rx && (idle_recv_polls % 100) == 0) {
+                puts("install: waiting for HTTPS response bytes...");
+            }
             int idle_limit = saw_any_rx ? PKG_HTTP_IDLE_RECV_LIMIT : PKG_HTTP_FIRST_BYTE_RECV_LIMIT;
             if (idle_recv_polls >= idle_limit) {
                 if (out_tls_err) *out_tls_err = MBEDTLS_ERR_SSL_TIMEOUT;
@@ -846,7 +900,7 @@ static int pkg_https_get_stream_once(const char* url,
                 (void)eyn_sys_net_tcp_close();
                 return -1;
             }
-            usleep(20000);
+            usleep(10000);
             continue;
         }
 
@@ -1122,11 +1176,11 @@ static int pkg_http_get_stream_once(const char* url,
                     printf("install: TLS allocator pressure (code %d); retrying HTTPS request\n",
                            last_tls_err);
                     (void)eyn_sys_net_tcp_close();
-                    usleep(150000);
+                    usleep(20000);
                 } else {
                     puts("install: retrying HTTPS request after timeout/failure");
                     (void)eyn_sys_net_tcp_close();
-                    usleep(50000);
+                    usleep(10000);
                 }
             }
         }
@@ -1218,7 +1272,7 @@ static int pkg_http_get_stream_once(const char* url,
                 (void)eyn_sys_net_tcp_close();
                 return -1;
             }
-            usleep(10000);
+            usleep(5000);
             continue;
         }
 

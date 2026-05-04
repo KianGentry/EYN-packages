@@ -379,8 +379,10 @@ static int install_install_one(const char* requested_name) {
     if (!requested_name || !requested_name[0]) return 1;
 
     PackageIndex index;
-    if (install_fetch_index_cached_first(&index) != 0) {
-        return 1;
+    if (install_fetch_index_network(&index) != 0) {
+        if (install_fetch_index_cached_first(&index) != 0) {
+            return 1;
+        }
     }
 
     const Package* pkg = install_index_find_ci(&index, requested_name);
