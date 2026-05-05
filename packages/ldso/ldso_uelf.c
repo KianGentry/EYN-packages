@@ -7,7 +7,28 @@
 
 #include <eynos_cmdmeta.h>
 
+/* Forward declarations for mmap/munmap */
+extern void* mmap(void* addr, size_t length, int prot, int flags, int fd, long offset);
+extern int munmap(void* addr, size_t length);
+
 EYN_CMDMETA_V1("Minimal ELF dynamic loader for EYN-OS.", "ldso <program> [args...]");
+
+#ifndef PROT_READ
+#define PROT_READ 0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC 0x4
+#endif
+
+#ifndef MAP_SHARED
+#define MAP_SHARED 0x01
+#define MAP_PRIVATE 0x02
+#define MAP_FIXED 0x10
+#define MAP_ANONYMOUS 0x20
+#endif
+
+#ifndef MAP_FAILED
+#define MAP_FAILED ((void*)-1)
+#endif
 
 #define EI_NIDENT   16
 #define EI_MAG0     0
@@ -214,27 +235,13 @@ static int file_read_all(const char* path, uint8_t** out_data, size_t* out_size)
         return -1;
     }
 
-    uint8_t* data = (uint8_t*)malloc((size_t)sz);
-    if (!data) {
-        close(fd);
+    void* mapped = mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) {
         return -1;
     }
 
-    size_t remaining = (size_t)sz;
-    size_t offset = 0;
-    while (remaining > 0) {
-        ssize_t n = read(fd, data + offset, remaining);
-        if (n <= 0) {
-            free(data);
-            close(fd);
-            return -1;
-        }
-        offset += (size_t)n;
-        remaining -= (size_t)n;
-    }
-
-    close(fd);
-    *out_data = data;
+    *out_data = (uint8_t*)mapped;
     *out_size = (size_t)sz;
     return 0;
 }
@@ -363,29 +370,29 @@ static loaded_object_t* load_object(const char* path) {
     }
 
     if (file_size < sizeof(Elf32_Ehdr)) {
-        free(file_data);
+        munmap(file_data, file_size);
         printf("ldso: invalid ELF %s\n", path);
         return NULL;
     }
 
     Elf32_Ehdr* eh = (Elf32_Ehdr*)file_data;
     if (eh->e_ident[EI_MAG0] != ELFMAG0 || eh->e_ident[EI_MAG1] != ELFMAG1 || eh->e_ident[EI_MAG2] != ELFMAG2 || eh->e_ident[EI_MAG3] != ELFMAG3) {
-        free(file_data);
+        munmap(file_data, file_size);
         printf("ldso: not an ELF file: %s\n", path);
         return NULL;
     }
     if (eh->e_ident[EI_CLASS] != ELFCLASS32 || eh->e_ident[EI_DATA] != ELFDATA2LSB || eh->e_machine != EM_386) {
-        free(file_data);
+        munmap(file_data, file_size);
         printf("ldso: unsupported ELF format: %s\n", path);
         return NULL;
     }
     if (eh->e_phoff == 0 || eh->e_phentsize < sizeof(Elf32_Phdr) || eh->e_phnum == 0) {
-        free(file_data);
+        munmap(file_data, file_size);
         printf("ldso: missing program headers: %s\n", path);
         return NULL;
     }
     if ((uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * (uint64_t)eh->e_phentsize > (uint64_t)file_size) {
-        free(file_data);
+        munmap(file_data, file_size);
         printf("ldso: program headers out of range: %s\n", path);
         return NULL;
     }
@@ -409,7 +416,7 @@ static loaded_object_t* load_object(const char* path) {
     }
 
     if (min_vaddr == 0xffffffffu || max_vaddr <= min_vaddr) {
-        free(file_data);
+        munmap(file_data, file_size);
         printf("ldso: no loadable segments: %s\n", path);
         return NULL;
     }
@@ -417,7 +424,7 @@ static loaded_object_t* load_object(const char* path) {
     size_t image_size = (size_t)align_up32(max_vaddr - min_vaddr, PAGE_SIZE);
     uint8_t* image = (uint8_t*)calloc(1, image_size);
     if (!image) {
-        free(file_data);
+        munmap(file_data, file_size);
         printf("ldso: out of memory loading %s\n", path);
         return NULL;
     }
@@ -427,7 +434,7 @@ static loaded_object_t* load_object(const char* path) {
         if (ph->p_type == PT_LOAD) {
             if (ph->p_offset + ph->p_filesz > file_size) {
                 free(image);
-                free(file_data);
+                munmap(file_data, file_size);
                 printf("ldso: segment out of range: %s\n", path);
                 return NULL;
             }
@@ -644,10 +651,11 @@ int main(int argc, char** argv) {
     }
 
     const char* target_path = argv[1];
+    /* Strict mode: use exactly the path provided by the user. Do not search
+     * alternative prefixes. This keeps behavior predictable when invoking
+     * ldso with an explicit path (absolute or relative). */
     loaded_object_t* main_obj = load_object(target_path);
-    if (!main_obj) {
-        return 1;
-    }
+    if (!main_obj) return 1;
 
     if (relocate_loaded_objects() != 0) {
         return 1;

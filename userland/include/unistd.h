@@ -83,6 +83,23 @@ int chdir(const char* path);
 /* Reposition the offset of an open file descriptor. */
 long lseek(int fd, long offset, int whence);
 
+/* Standard POSIX mmap/munmap for file-backed memory mapping. */
+#ifndef PROT_READ
+#define PROT_READ 0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC 0x4
+#endif
+
+#ifndef MAP_SHARED
+#define MAP_SHARED 0x01
+#define MAP_PRIVATE 0x02
+#define MAP_FIXED 0x10
+#define MAP_ANONYMOUS 0x20
+#endif
+
+void* mmap(void* addr, size_t length, int prot, int flags, int fd, long offset);
+int munmap(void* addr, size_t length);
+
 // Low-memory streaming file writer (EYNFS only today).
 int eynfs_stream_begin(const char* path);
 ssize_t eynfs_stream_write(int handle, const void* buf, size_t len);
