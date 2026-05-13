@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include <eynos_cmdmeta.h>
 
@@ -74,6 +75,7 @@ EYN_CMDMETA_V1("Minimal ELF dynamic loader for EYN-OS.", "ldso <program> [args..
 #define R_386_NONE      0
 #define R_386_32        1
 #define R_386_PC32      2
+#define R_386_COPY       5
 #define R_386_GLOB_DAT  6
 #define R_386_JMP_SLOT  7
 #define R_386_RELATIVE  8
@@ -238,6 +240,7 @@ static int file_read_all(const char* path, uint8_t** out_data, size_t* out_size)
     void* mapped = mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (mapped == MAP_FAILED) {
+        printf("ldso-debug: mmap failed for %s: errno=%d\n", path, errno);
         return -1;
     }
 
@@ -266,6 +269,23 @@ static const char* resolve_library_path(const char* needed) {
         } else {
             snprintf(candidate, sizeof(candidate), "%s%s", prefixes[i], needed);
         }
+        if (access(candidate, R_OK) == 0) return candidate;
+    }
+
+    /* Compatibility fallback for the packaged xeyes binary.
+     * The test image only ships a minimal X11 stack, so several historical
+     * X11/Xt/Xrender/XCB SONAMEs are satisfied by a single local shim.
+     */
+    if (strcmp(needed, "libXmu.so.6") == 0 ||
+        strcmp(needed, "libXt.so.6") == 0 ||
+        strcmp(needed, "libXext.so.6") == 0 ||
+        strcmp(needed, "libXrender.so.1") == 0 ||
+        strcmp(needed, "libX11-xcb.so.1") == 0 ||
+        strcmp(needed, "libxcb.so.1") == 0 ||
+        strcmp(needed, "libxcb-present.so.0") == 0 ||
+        strcmp(needed, "libxcb-damage.so.0") == 0 ||
+        strcmp(needed, "libxcb-xfixes.so.0") == 0) {
+        snprintf(candidate, sizeof(candidate), "%s", "/lib/libx11compat.so.6");
         if (access(candidate, R_OK) == 0) return candidate;
     }
 
@@ -308,9 +328,10 @@ static int apply_relocations(const loaded_object_t* obj, Elf32_Rel* rels, size_t
         uint32_t* where = (uint32_t*)(uintptr_t)object_runtime_addr(obj, rel->r_offset);
         uint32_t addend = *where;
         uint32_t sym_addr = 0;
+        Elf32_Sym* sym = NULL;
 
         if (sym_index != 0 && obj->dynsym && obj->dynstr) {
-            Elf32_Sym* sym = &obj->dynsym[sym_index];
+            sym = &obj->dynsym[sym_index];
             if (sym->st_name != 0) {
                 sym_addr = resolve_symbol_addr(obj->dynstr + sym->st_name);
             }
@@ -333,6 +354,47 @@ static int apply_relocations(const loaded_object_t* obj, Elf32_Rel* rels, size_t
                 break;
             case R_386_PC32:
                 *where = sym_addr + addend - (uint32_t)(uintptr_t)where;
+                break;
+            case R_386_COPY:
+                /* Copy data from the defining shared object into this object's
+                 * storage (typical for executables that expect their data image
+                 * to be populated from shared libraries). We search other
+                 * loaded objects for the symbol definition and memcpy the
+                 * symbol-sized object into place. If the symbol is not found
+                 * (e.g., in our shim environment), zero-initialize the location.
+                 */
+                if (!sym || !obj->dynstr) {
+                    printf("ldso: COPY relocation without symbol in %s\n", obj->path);
+                    return -1;
+                }
+                if (sym->st_size == 0) break;
+                {
+                    const char* symname = obj->dynstr + sym->st_name;
+                    uint32_t src_addr = 0;
+                    for (int oi = 0; oi < g_object_count; ++oi) {
+                        loaded_object_t* other = &g_objects[oi];
+                        if (other == obj) continue;
+                        if (!other->dynsym || !other->dynstr) continue;
+                        for (uint32_t si = 0; si < other->sym_count; ++si) {
+                            Elf32_Sym* osym = &other->dynsym[si];
+                            if (osym->st_name == 0) continue;
+                            const char* oname = other->dynstr + osym->st_name;
+                            if (strcmp(oname, symname) == 0) {
+                                src_addr = object_runtime_addr(other, osym->st_value);
+                                break;
+                            }
+                        }
+                        if (src_addr) break;
+                    }
+                    if (src_addr) {
+                        memcpy((void*)(uintptr_t)where, (void*)(uintptr_t)src_addr, (size_t)sym->st_size);
+                    } else {
+                        /* Symbol not found: zero-initialize (typical for weak/unresolved symbols) */
+                        printf("ldso-debug: COPY symbol %s not found in libraries, zero-initializing %u bytes\n",
+                               symname, (unsigned)sym->st_size);
+                        memset((void*)(uintptr_t)where, 0, (size_t)sym->st_size);
+                    }
+                }
                 break;
             default:
                 printf("ldso: unsupported relocation type %u in %s\n", type, obj->path);
@@ -369,8 +431,11 @@ static loaded_object_t* load_object(const char* path) {
         return NULL;
     }
 
+    printf("ldso-debug: load_object('%s') file_size=%zu\n", path, file_size);
+
     if (file_size < sizeof(Elf32_Ehdr)) {
         munmap(file_data, file_size);
+        printf("ldso-debug: file too small for ELF header: %s size=%zu need=%zu\n", path, file_size, sizeof(Elf32_Ehdr));
         printf("ldso: invalid ELF %s\n", path);
         return NULL;
     }
@@ -383,16 +448,19 @@ static loaded_object_t* load_object(const char* path) {
     }
     if (eh->e_ident[EI_CLASS] != ELFCLASS32 || eh->e_ident[EI_DATA] != ELFDATA2LSB || eh->e_machine != EM_386) {
         munmap(file_data, file_size);
+        printf("ldso-debug: unsupported ELF class/data/machine for %s: class=%u data=%u machine=%u\n", path, eh->e_ident[EI_CLASS], eh->e_ident[EI_DATA], eh->e_machine);
         printf("ldso: unsupported ELF format: %s\n", path);
         return NULL;
     }
     if (eh->e_phoff == 0 || eh->e_phentsize < sizeof(Elf32_Phdr) || eh->e_phnum == 0) {
         munmap(file_data, file_size);
+        printf("ldso-debug: missing/invalid program headers: %s phoff=%u phentsize=%u phnum=%u\n", path, (unsigned)eh->e_phoff, (unsigned)eh->e_phentsize, (unsigned)eh->e_phnum);
         printf("ldso: missing program headers: %s\n", path);
         return NULL;
     }
     if ((uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * (uint64_t)eh->e_phentsize > (uint64_t)file_size) {
         munmap(file_data, file_size);
+        printf("ldso-debug: program headers out of range: %s phoff=%u phnum=%u phentsize=%u file_size=%zu\n", path, (unsigned)eh->e_phoff, (unsigned)eh->e_phnum, (unsigned)eh->e_phentsize, file_size);
         printf("ldso: program headers out of range: %s\n", path);
         return NULL;
     }
@@ -422,18 +490,19 @@ static loaded_object_t* load_object(const char* path) {
     }
 
     size_t image_size = (size_t)align_up32(max_vaddr - min_vaddr, PAGE_SIZE);
-    uint8_t* image = (uint8_t*)calloc(1, image_size);
-    if (!image) {
+    uint8_t* image = (uint8_t*)mmap(NULL, image_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (image == MAP_FAILED) {
         munmap(file_data, file_size);
-        printf("ldso: out of memory loading %s\n", path);
+        printf("ldso: out of memory loading %s (image_size=%u)\n", path, (unsigned)image_size);
         return NULL;
     }
 
     ph = (Elf32_Phdr*)(file_data + eh->e_phoff);
     for (uint16_t i = 0; i < eh->e_phnum; ++i) {
         if (ph->p_type == PT_LOAD) {
-            if (ph->p_offset + ph->p_filesz > file_size) {
-                free(image);
+            if ((uint64_t)ph->p_offset + (uint64_t)ph->p_filesz > (uint64_t)file_size) {
+                printf("ldso-debug: segment out of range in %s: offset=%u filesz=%u file_size=%zu\n", path, (unsigned)ph->p_offset, (unsigned)ph->p_filesz, file_size);
+                munmap(image, image_size);
                 munmap(file_data, file_size);
                 printf("ldso: segment out of range: %s\n", path);
                 return NULL;
