@@ -24,7 +24,7 @@ typedef struct {
 } help_cmd_t;
 
 #define HELP_BIN_DIR "/binaries"
-#define HELP_MAX_CMDS 200
+#define HELP_MAX_CMDS 256
 
 static help_cmd_t g_cmds[HELP_MAX_CMDS];
 static int g_cmd_count = 0;
@@ -245,7 +245,7 @@ static void draw_help_gui(int h, int selected) {
     if (sz.w <= 0) sz.w = 720;
     if (sz.h <= 0) sz.h = 420;
 
-    gui_rgb_t bg = { .r = 8, .g = 8, .b = 10, ._pad = 0 };
+    gui_rgb_t bg = { .r = 8, .g = 8, .b = 8, ._pad = 0 };
     (void)gui_clear(h, &bg);
 
     int left_w = (sz.w * 32) / 100;
@@ -253,12 +253,12 @@ static void draw_help_gui(int h, int selected) {
     int body_y = 0;
     int body_h = sz.h - body_y;
 
-    gui_rect_t left_bg = { .x = 0, .y = body_y, .w = left_w, .h = body_h, .r = 14, .g = 14, .b = 18, ._pad = 0 };
-    gui_rect_t right_bg = { .x = left_w + 1, .y = body_y, .w = sz.w - left_w - 1, .h = body_h, .r = 10, .g = 10, .b = 14, ._pad = 0 };
+    gui_rect_t left_bg = { .x = 0, .y = body_y, .w = left_w, .h = body_h, .r = 14, .g = 14, .b = 14, ._pad = 0 };
+    gui_rect_t right_bg = { .x = left_w + 1, .y = body_y, .w = sz.w - left_w - 1, .h = body_h, .r = 10, .g = 10, .b = 10, ._pad = 0 };
     (void)gui_fill_rect(h, &left_bg);
     (void)gui_fill_rect(h, &right_bg);
 
-    gui_line_t sep = { .x1 = left_w, .y1 = body_y, .x2 = left_w, .y2 = sz.h - 1, .r = 70, .g = 70, .b = 80, ._pad = 0 };
+    gui_line_t sep = { .x1 = left_w, .y1 = body_y, .x2 = left_w, .y2 = sz.h - 1, .r = 70, .g = 70, .b = 70, ._pad = 0 };
     (void)gui_draw_line(h, &sep);
 
     int max_rows = (body_h - 8) / 12;
@@ -273,9 +273,9 @@ static void draw_help_gui(int h, int selected) {
         if (idx >= g_cmd_count) break;
         int y = body_y + 4 + (i * 12);
         if (idx == selected) {
-            gui_rect_t hi = { .x = 2, .y = y - 1, .w = left_w - 4, .h = 12, .r = 45, .g = 45, .b = 68, ._pad = 0 };
+            gui_rect_t hi = { .x = 2, .y = y - 1, .w = left_w - 4, .h = 12, .r = 45, .g = 45, .b = 45, ._pad = 0 };
             (void)gui_fill_rect(h, &hi);
-            gui_text_t t = { .x = 6, .y = y, .r = 255, .g = 255, .b = 160, ._pad = 0, .text = g_cmds[idx].name };
+            gui_text_t t = { .x = 6, .y = y, .r = 255, .g = 255, .b = 255, ._pad = 0, .text = g_cmds[idx].name };
             (void)gui_draw_text(h, &t);
         } else {
             gui_text_t t = { .x = 6, .y = y, .r = 215, .g = 215, .b = 215, ._pad = 0, .text = g_cmds[idx].name };
