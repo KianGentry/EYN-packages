@@ -64,13 +64,13 @@ typedef struct { const char* text; uint8_t r, g, b; } seg_t;
 static const seg_t logo[LOGO_LINES][MAX_SEGS] = {
     { {" #######", R},{"====    =====", G},{"+++++    +++++", B}, {NULL,0,0,0} },
     { {" ########", R},{"====  ====", G},{"+++++++   ++++  ", B}, {NULL,0,0,0} },
-    { {" ##########", R},{"======", G},{"++++++++ +++++    ", B}, {NULL,0,0,0} },
+    { {" ##########", R},{"======", G},{"++++++++  ++++    ", B}, {NULL,0,0,0} },
     { {" ###########", R},{"====", G},{"++++ +++++++++     ", B}, {NULL,0,0,0} },
-    { {" ##########", R},{"====", G},{"+++++  +++++++      ", B}, {NULL,0,0,0} },
+    { {" ##########", R},{"====", G},{"++++   +++++++      ", B}, {NULL,0,0,0} },
     { {" ########", R},{"====", G},{"++++    ++++++        ", B}, {NULL,0,0,0} },
     { {" #######", R},{"====", G},{"++++     +++++         ", B}, {NULL,0,0,0} },
     { {"                                   ", COL_DEFAULT}, {NULL,0,0,0} },
-    { {" EYN-OS Release 16                 ", COL_LABEL  }, {NULL,0,0,0} },
+    { {" EYN-OS Release 15                 ", COL_LABEL  }, {NULL,0,0,0} },
 };
 
 #undef R
@@ -98,9 +98,18 @@ typedef struct {
 } fetch_info_t;
 
 static void gather(fetch_info_t* f) {
-    snprintf(f->os,     sizeof(f->os),     "EYN-OS Release 16");
-    snprintf(f->kernel, sizeof(f->kernel),  "EYN/i386");
-    snprintf(f->shell,  sizeof(f->shell),   "eynsh");
+    /* Get system information via syscall */
+    eyn_sysinfo_t sysinfo;
+    if (eyn_sys_get_sysinfo(&sysinfo) == 0) {
+        snprintf(f->os,     sizeof(f->os),     "%s", sysinfo.os_version);
+        snprintf(f->kernel, sizeof(f->kernel), "%s", sysinfo.kernel_version);
+        snprintf(f->shell,  sizeof(f->shell),  "%s", sysinfo.shell);
+    } else {
+        /* Fallback if syscall fails */
+        snprintf(f->os,     sizeof(f->os),     "EYN-OS Release 15");
+        snprintf(f->kernel, sizeof(f->kernel), "v1.0");
+        snprintf(f->shell,  sizeof(f->shell),  "eynsh");
+    }
 
     /* Uptime */
     int ms = eyn_syscall0(EYN_SYSCALL_GET_TICKS_MS);
