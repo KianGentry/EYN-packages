@@ -305,6 +305,8 @@ enum {
     EYN_SYSCALL_TTY_GET_WINSIZE = 148,
     // allocate PTY endpoints: args (int out_fds[2]) -> 0 or -1
     EYN_SYSCALL_PTY_OPEN = 149,
+    // retrieve basic system info: args (eyn_sysinfo_t* out) -> 0 or -1
+    EYN_SYSCALL_GET_SYSINFO = 152,
 };
 
 #define EYN_TTY_MODE_RAW 0x0001
@@ -313,6 +315,12 @@ typedef struct {
     uint16_t rows;
     uint16_t cols;
 } eyn_tty_winsize_t;
+
+typedef struct {
+    char os_version[64];
+    char kernel_version[32];
+    char shell[64];
+} eyn_sysinfo_t;
 
 typedef struct {
     const char* path;
@@ -890,6 +898,10 @@ static inline int eyn_sys_pty_open(int out_fds[2]) {
 
 static inline int eyn_sys_spawn_ex(const eyn_spawn_ex_req_t* req) {
     return eyn_syscall1(EYN_SYSCALL_SPAWN_EX, (int)(uintptr_t)req);
+}
+
+static inline int eyn_sys_get_sysinfo(eyn_sysinfo_t* out) {
+    return eyn_syscall1(EYN_SYSCALL_GET_SYSINFO, (int)(uintptr_t)out);
 }
 
 static inline int eyn_sys_chdir(const char* path) {
