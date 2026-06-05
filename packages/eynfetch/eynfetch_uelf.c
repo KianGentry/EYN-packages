@@ -106,9 +106,9 @@ static void gather(fetch_info_t* f) {
         snprintf(f->shell,  sizeof(f->shell),  "%s", sysinfo.shell);
     } else {
         /* Fallback if syscall fails */
-        snprintf(f->os,     sizeof(f->os),     "EYN-OS Release 15");
-        snprintf(f->kernel, sizeof(f->kernel), "v1.0");
-        snprintf(f->shell,  sizeof(f->shell),  "eynsh");
+        snprintf(f->os,     sizeof(f->os),     "EYN-OS");
+        snprintf(f->kernel, sizeof(f->kernel), "undefined");
+        snprintf(f->shell,  sizeof(f->shell),  "kernel");
     }
 
     /* Uptime */
