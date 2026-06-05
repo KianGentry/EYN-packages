@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <eynos_syscall.h>
 
 #include <eynos_cmdmeta.h>
 
@@ -15,6 +16,6 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    puts("EYN-OS Release 16");
+    printf("%s\n", eyn_sys_get_version());
     return 0;
 }

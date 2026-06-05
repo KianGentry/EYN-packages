@@ -1,5 +1,5 @@
 /*
- * eynfetch -- fastfetch-style system info display for EYN-OS
+ * eynfetch
  *
  * Colour output uses the EYN-OS vterm RGB escape:
  *   byte 0xFF followed by R, G, B sets the foreground colour.
@@ -16,7 +16,7 @@
 EYN_CMDMETA_V1("Display system information with ASCII art logo.", "eynfetch");
 
 /* ------------------------------------------------------------------ */
-/*  Colour helpers                                                       */
+/*  Colour helpers                                                    */
 /* ------------------------------------------------------------------ */
 
 static void set_colour(uint8_t r, uint8_t g, uint8_t b) {
@@ -41,11 +41,11 @@ static void write_nl(void) {
 #define COL_DEFAULT  200, 200, 200
 
 /* ------------------------------------------------------------------ */
-/*  ASCII art logo                                                       */
-/*                                                                      */
-/*  E = red pentagon/arrow    Y = green    N = blue                    */
-/*  Each element of logo_line is { text, r, g, b }.                    */
-/*  A NULL text pointer means end of segments for that line.           */
+/*  ASCII art logo                                                    */
+/*                                                                    */
+/*  E = red pentagon/arrow    Y = green    N = blue                   */
+/*  Each element of logo_line is { text, r, g, b }.                   */
+/*  A NULL text pointer means end of segments for that line.          */
 /* ------------------------------------------------------------------ */
 
 typedef struct { const char* text; uint8_t r, g, b; } seg_t;
@@ -55,10 +55,10 @@ typedef struct { const char* text; uint8_t r, g, b; } seg_t;
 #define B COL_BLUE
 
 /*
- * Logo is 9 lines tall.
+ * Logo is 7 lines tall.
  * Each line has up to 3 coloured segments (E, Y, N parts) + terminator.
  */
-#define LOGO_LINES 9
+#define LOGO_LINES 7
 #define MAX_SEGS   4   /* segments per line + null terminator */
 
 static const seg_t logo[LOGO_LINES][MAX_SEGS] = {
@@ -69,8 +69,6 @@ static const seg_t logo[LOGO_LINES][MAX_SEGS] = {
     { {" ##########", R},{"====", G},{"++++   +++++++      ", B}, {NULL,0,0,0} },
     { {" ########", R},{"====", G},{"++++    ++++++        ", B}, {NULL,0,0,0} },
     { {" #######", R},{"====", G},{"++++     +++++         ", B}, {NULL,0,0,0} },
-    { {"                                    ", COL_DEFAULT}, {NULL,0,0,0} },
-    { {"                                    ", COL_DEFAULT  }, {NULL,0,0,0} },
 };
 
 #undef R
@@ -169,7 +167,7 @@ static void gather(fetch_info_t* f) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Rendering                                                            */
+/*  Rendering                                                         */
 /* ------------------------------------------------------------------ */
 
 static void print_fetch(void) {
@@ -242,7 +240,7 @@ static void print_fetch(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Entry point                                                          */
+/*  Entry point                                                       */
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char** argv) {
