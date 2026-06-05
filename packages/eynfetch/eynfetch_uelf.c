@@ -70,7 +70,7 @@ static const seg_t logo[LOGO_LINES][MAX_SEGS] = {
     { {" ########", R},{"====", G},{"++++    ++++++        ", B}, {NULL,0,0,0} },
     { {" #######", R},{"====", G},{"++++     +++++         ", B}, {NULL,0,0,0} },
     { {"                                    ", COL_DEFAULT}, {NULL,0,0,0} },
-    { {"                                    ", COL_LABEL  }, {NULL,0,0,0} },
+    { {"                                    ", COL_DEFAULT  }, {NULL,0,0,0} },
 };
 
 #undef R
