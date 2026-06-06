@@ -3,6 +3,7 @@
 
 // malloc/free are provided by userland/libc/stdlib.c
 void* malloc(size_t n);
+static unsigned char tolower_ascii(unsigned char c);
 
 static int cstr_ptr_is_invalid(const char* s) {
     if (!s) return 1;
@@ -54,6 +55,17 @@ char* strcpy(char* dst, const char* src) {
     return dst;
 }
 
+char* stpcpy(char* dst, const char* src) {
+    if (!dst) return dst;
+    if (!src) {
+        dst[0] = '\0';
+        return dst;
+    }
+    while (*src) *dst++ = *src++;
+    *dst = '\0';
+    return dst;
+}
+
 char* strncpy(char* dst, const char* src, size_t n) {
     if (!dst || n == 0) return dst;
     size_t i = 0;
@@ -82,6 +94,13 @@ char* strncat(char* dst, const char* src, size_t n) {
     }
     dst[dlen + i] = '\0';
     return dst;
+}
+
+char* stpncpy(char* dst, const char* src, size_t n) {
+    size_t i = 0;
+    for (; i < n && src[i]; i++) dst[i] = src[i];
+    for (; i < n; i++) dst[i] = '\0';
+    return dst + i;
 }
 
 char* strchr(const char* s, int c) {
@@ -126,11 +145,69 @@ char* strstr(const char* haystack, const char* needle) {
     return 0;
 }
 
+char* strcasestr(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return 0;
+    if (!*needle) return (char*)haystack;
+
+    size_t nlen = strlen(needle);
+    for (const char* p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < nlen) {
+            unsigned char a = tolower_ascii((unsigned char)p[i]);
+            unsigned char b = tolower_ascii((unsigned char)needle[i]);
+            if (a != b || p[i] == '\0') break;
+            i++;
+        }
+        if (i == nlen) return (char*)p;
+    }
+    return 0;
+}
+
+size_t strcspn(const char* s, const char* reject) {
+    size_t n = 0;
+    if (!s || !reject) return 0;
+    while (s[n]) {
+        for (const char* r = reject; *r; r++) {
+            if (s[n] == *r) return n;
+        }
+        n++;
+    }
+    return n;
+}
+
+size_t strspn(const char* s, const char* accept) {
+    size_t n = 0;
+    if (!s || !accept) return 0;
+    while (s[n]) {
+        int found = 0;
+        for (const char* a = accept; *a; a++) {
+            if (s[n] == *a) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) break;
+        n++;
+    }
+    return n;
+}
+
 void* memcpy(void* dst, const void* src, size_t n) {
     unsigned char* d = (unsigned char*)dst;
     const unsigned char* s = (const unsigned char*)src;
     for (size_t i = 0; i < n; i++) d[i] = s[i];
     return dst;
+}
+
+void* memccpy(void* dst, const void* src, int c, size_t n) {
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    unsigned char stop = (unsigned char)c;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+        if (s[i] == stop) return d + i + 1;
+    }
+    return 0;
 }
 
 void* memmove(void* dst, const void* src, size_t n) {
@@ -150,6 +227,30 @@ void* memset(void* dst, int v, size_t n) {
     unsigned char b = (unsigned char)v;
     for (size_t i = 0; i < n; i++) d[i] = b;
     return dst;
+}
+
+void* memchr(const void* s, int c, size_t n) {
+    const unsigned char* p = (const unsigned char*)s;
+    unsigned char target = (unsigned char)c;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == target) return (void*)(p + i);
+    }
+    return 0;
+}
+
+void* memmem(const void* haystack, size_t haystacklen, const void* needle, size_t needlelen) {
+    if (!haystack || !needle) return 0;
+    if (needlelen == 0) return (void*)haystack;
+    if (haystacklen < needlelen) return 0;
+
+    const unsigned char* h = (const unsigned char*)haystack;
+    const unsigned char* n = (const unsigned char*)needle;
+    for (size_t i = 0; i + needlelen <= haystacklen; i++) {
+        if (h[i] == n[0] && memcmp(h + i, n, needlelen) == 0) {
+            return (void*)(h + i);
+        }
+    }
+    return 0;
 }
 
 int memcmp(const void* a, const void* b, size_t n) {
@@ -212,6 +313,17 @@ int strcasecmp(const char* a, const char* b) {
     return tolower_ascii((unsigned char)*a) - tolower_ascii((unsigned char)*b);
 }
 
+int ffs(int i) {
+    if (i == 0) return 0;
+    int bit = 1;
+    unsigned int v = (unsigned int)i;
+    while ((v & 1u) == 0u) {
+        v >>= 1;
+        bit++;
+    }
+    return bit;
+}
+
 static int is_delim(char c, const char* delim) {
     if (!delim) return 0;
     for (const char* p = delim; *p; p++) {
@@ -238,4 +350,22 @@ char* strtok(char* str, const char* delim) {
         s_next = 0;
     }
     return tok;
+}
+
+char* strsep(char** stringp, const char* delim) {
+    if (!stringp || !*stringp) return 0;
+    char* start = *stringp;
+    char* p = start;
+
+    while (*p) {
+        if (is_delim(*p, delim)) {
+            *p = '\0';
+            *stringp = p + 1;
+            return start;
+        }
+        p++;
+    }
+
+    *stringp = 0;
+    return start;
 }

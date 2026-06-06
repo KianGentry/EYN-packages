@@ -8,5 +8,6 @@ int isalpha(int c);
 int isalnum(int c);
 int isxdigit(int c);
 int ispunct(int c);
+int isprint(int c);
 int tolower(int c);
 int toupper(int c);

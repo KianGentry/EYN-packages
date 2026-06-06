@@ -98,6 +98,10 @@ typedef unsigned long long uintmax_t;
 #define INTPTR_MAX INT32_MAX
 #define UINTPTR_MAX UINT32_MAX
 
+#ifndef SIZE_MAX
+#define SIZE_MAX UINT32_MAX
+#endif
+
 // Limits of greatest-width integer types
 #define INTMAX_MIN INT64_MIN
 #define INTMAX_MAX INT64_MAX

@@ -15,6 +15,9 @@ static uint8_t g_heap[USERLAND_HEAP_SIZE];
 static size_t g_heap_used = 0;
 static uint32_t g_rand_state = 1u;
 static int g_rand_seeded = 0;
+char** environ = NULL;
+static int g_libc_argc = 0;
+static char** g_libc_argv = NULL;
 
 static uint32_t mix32(uint32_t x) {
     x ^= x >> 16;
@@ -98,9 +101,128 @@ int atexit(void (*fn)(void)) {
     return 0;
 }
 
+void _eyn_libc_init(int argc, char** argv, char** envp) {
+    g_libc_argc = argc;
+    g_libc_argv = argv;
+    environ = envp;
+    (void)g_libc_argc;
+    (void)g_libc_argv;
+}
+
 char* getenv(const char* name) {
-    (void)name;
+    if (!name || !environ) return NULL;
+
+    size_t name_len = strlen(name);
+    for (int i = 0; environ[i]; ++i) {
+        char* entry = environ[i];
+        if (strncmp(entry, name, name_len) == 0 && entry[name_len] == '=') {
+            return entry + name_len + 1;
+        }
+    }
     return NULL;
+}
+
+static int env_name_len(const char* entry) {
+    int n = 0;
+    while (entry[n] && entry[n] != '=') n++;
+    return n;
+}
+
+static int env_count(void) {
+    int n = 0;
+    if (!environ) return 0;
+    while (environ[n]) n++;
+    return n;
+}
+
+int setenv(const char* name, const char* value, int overwrite) {
+    if (!name || !*name || strchr(name, '=')) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!value) value = "";
+
+    int nlen = (int)strlen(name);
+    int vlen = (int)strlen(value);
+    int count = env_count();
+
+    for (int i = 0; i < count; i++) {
+        if (env_name_len(environ[i]) == nlen && !strncmp(environ[i], name, (size_t)nlen)) {
+            if (!overwrite) return 0;
+
+            char* nv = (char*)malloc((size_t)nlen + 1u + (size_t)vlen + 1u);
+            if (!nv) return -1;
+            memcpy(nv, name, (size_t)nlen);
+            nv[nlen] = '=';
+            memcpy(nv + nlen + 1, value, (size_t)vlen + 1u);
+            environ[i] = nv;
+            return 0;
+        }
+    }
+
+    char** newenv = (char**)malloc(sizeof(char*) * (size_t)(count + 2));
+    if (!newenv) return -1;
+
+    for (int i = 0; i < count; i++) newenv[i] = environ[i];
+
+    char* nv = (char*)malloc((size_t)nlen + 1u + (size_t)vlen + 1u);
+    if (!nv) return -1;
+    memcpy(nv, name, (size_t)nlen);
+    nv[nlen] = '=';
+    memcpy(nv + nlen + 1, value, (size_t)vlen + 1u);
+    newenv[count] = nv;
+    newenv[count + 1] = NULL;
+    environ = newenv;
+    return 0;
+}
+
+int unsetenv(const char* name) {
+    if (!name || !*name || strchr(name, '=')) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!environ) return 0;
+
+    int nlen = (int)strlen(name);
+    int count = env_count();
+    int w = 0;
+    for (int i = 0; i < count; i++) {
+        if (env_name_len(environ[i]) == nlen && !strncmp(environ[i], name, (size_t)nlen)) {
+            continue;
+        }
+        environ[w++] = environ[i];
+    }
+    environ[w] = NULL;
+    return 0;
+}
+
+int putenv(char* string) {
+    if (!string || !strchr(string, '=')) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int nlen = env_name_len(string);
+    if (nlen <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int count = env_count();
+    for (int i = 0; i < count; i++) {
+        if (env_name_len(environ[i]) == nlen && !strncmp(environ[i], string, (size_t)nlen)) {
+            environ[i] = string;
+            return 0;
+        }
+    }
+
+    char** newenv = (char**)malloc(sizeof(char*) * (size_t)(count + 2));
+    if (!newenv) return -1;
+    for (int i = 0; i < count; i++) newenv[i] = environ[i];
+    newenv[count] = string;
+    newenv[count + 1] = NULL;
+    environ = newenv;
+    return 0;
 }
 
 void abort(void) {
@@ -123,6 +245,53 @@ int rand(void) {
     }
     g_rand_state = g_rand_state * 1103515245u + 12345u;
     return (int)((g_rand_state >> 16) & RAND_MAX);
+}
+
+void srandom(unsigned int seed) {
+    srand(seed);
+}
+
+long random(void) {
+    if (!g_rand_seeded) {
+        srand(entropy_seed());
+    }
+    g_rand_state = g_rand_state * 1103515245u + 12345u;
+    return (long)(g_rand_state & 0x7fffffffu);
+}
+
+void qsort(void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*)) {
+    if (!base || !compar || size == 0 || nmemb < 2) return;
+
+    unsigned char* a = (unsigned char*)base;
+    unsigned char* tmp = (unsigned char*)malloc(size);
+    if (!tmp) return;
+
+    for (size_t i = 1; i < nmemb; i++) {
+        memcpy(tmp, a + i * size, size);
+        size_t j = i;
+        while (j > 0 && compar(a + (j - 1) * size, tmp) > 0) {
+            memcpy(a + j * size, a + (j - 1) * size, size);
+            j--;
+        }
+        memcpy(a + j * size, tmp, size);
+    }
+}
+
+void* bsearch(const void* key, const void* base, size_t nmemb, size_t size,
+              int (*compar)(const void*, const void*)) {
+    size_t lo = 0;
+    size_t hi = nmemb;
+    const unsigned char* b = (const unsigned char*)base;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const void* elem = b + mid * size;
+        int c = compar(key, elem);
+        if (c < 0) hi = mid;
+        else if (c > 0) lo = mid + 1;
+        else return (void*)elem;
+    }
+    return NULL;
 }
 
 unsigned long strtoul(const char* nptr, char** endptr, int base) {
@@ -351,6 +520,10 @@ long atol(const char* s) {
     return (long)atoi(s);
 }
 
+long long atoll(const char* s) {
+     return strtoll(s, NULL, 10);
+}
+
 int abs(int x) {
     return x < 0 ? -x : x;
 }
@@ -359,8 +532,20 @@ long labs(long x) {
     return x < 0 ? -x : x;
 }
 
+long long llabs(long long x) {
+    return x < 0 ? -x : x;
+}
+
 long strtol(const char* nptr, char** endptr, int base) {
     return (long)strtoul(nptr, endptr, base);
+}
+
+long long strtoll(const char* nptr, char** endptr, int base) {
+    return (long long)strtoul(nptr, endptr, base);
+}
+
+unsigned long long strtoull(const char* nptr, char** endptr, int base) {
+    return (unsigned long long)strtoul(nptr, endptr, base);
 }
 
 double strtod(const char* nptr, char** endptr) {

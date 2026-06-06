@@ -4,6 +4,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <errno.h>
+#include <mntent.h>
 
 struct FILE {
     int kind;
@@ -28,6 +30,8 @@ struct FILE {
      */
     long pos;
     int  eof_flag;
+    int  has_unget;
+    unsigned char unget_ch;
 };
 
 enum {
@@ -179,9 +183,36 @@ int fputc(int c, FILE* f) {
 
 int fgetc(FILE* f) {
     if (!f) return EOF;
+    if (f->has_unget) {
+        f->has_unget = 0;
+        return (int)f->unget_ch;
+    }
     unsigned char ch;
     if (fread(&ch, 1, 1, f) != 1) return EOF;
     return (int)ch;
+}
+
+int ungetc(int c, FILE* f) {
+    if (!f || c == EOF) return EOF;
+    if (f->has_unget) return EOF;
+    f->unget_ch = (unsigned char)c;
+    f->has_unget = 1;
+    f->eof_flag = 0;
+    return (unsigned char)c;
+}
+
+char* fgets(char* s, int size, FILE* f) {
+    if (!s || size <= 0 || !f) return NULL;
+    int i = 0;
+    while (i < size - 1) {
+        int c = fgetc(f);
+        if (c == EOF) break;
+        s[i++] = (char)c;
+        if (c == '\n') break;
+    }
+    if (i == 0) return NULL;
+    s[i] = '\0';
+    return s;
 }
 
 int fputs(const char* s, FILE* f) {
@@ -560,6 +591,10 @@ int printf(const char* fmt, ...) {
     return rc;
 }
 
+int vprintf(const char* fmt, va_list ap) {
+    return vfprintf(stdout, fmt, ap);
+}
+
 int vsprintf(char* buf, const char* fmt, va_list ap) {
     /* Use vsnprintf with an absurdly large limit.
      * Callers are responsible for buffer sizing (this is the old C API). */
@@ -616,6 +651,14 @@ void setbuf(FILE* f, char* buf) {
     (void)f; (void)buf;
 }
 
+int setvbuf(FILE* f, char* buf, int mode, size_t size) {
+    (void)f;
+    (void)buf;
+    (void)mode;
+    (void)size;
+    return 0;
+}
+
 /* getchar -- read a single character from stdin. */
 int getchar(void) {
     return fgetc(stdin);
@@ -625,11 +668,147 @@ int putchar(int ch) {
     return fputc(ch, stdout);
 }
 
+int putc(int c, FILE* f) {
+    return fputc(c, f);
+}
+
 int puts(const char* s) {
     if (!s) return EOF;
     if (fputs(s, stdout) == EOF) return EOF;
     if (fputc('\n', stdout) == EOF) return EOF;
     return 0;
+}
+
+ssize_t getdelim(char** lineptr, size_t* n, int delim, FILE* stream) {
+    if (!lineptr || !n || !stream) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (!*lineptr || *n == 0) {
+        *n = 128;
+        *lineptr = (char*)malloc(*n);
+        if (!*lineptr) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+
+    size_t len = 0;
+    for (;;) {
+        int ch = fgetc(stream);
+        if (ch == EOF) {
+            if (len == 0) return -1;
+            break;
+        }
+
+        if (len + 1 >= *n) {
+            size_t new_n = (*n < 4096) ? (*n * 2) : (*n + 4096);
+            char* np = (char*)realloc(*lineptr, new_n);
+            if (!np) {
+                errno = ENOMEM;
+                return -1;
+            }
+            *lineptr = np;
+            *n = new_n;
+        }
+
+        (*lineptr)[len++] = (char)ch;
+        if (ch == delim) break;
+    }
+
+    (*lineptr)[len] = '\0';
+    return (ssize_t)len;
+}
+
+ssize_t getline(char** lineptr, size_t* n, FILE* stream) {
+    return getdelim(lineptr, n, '\n', stream);
+}
+
+int dprintf(int fd, const char* fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return -1;
+
+    size_t len = (size_t)n;
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    ssize_t wr = write(fd, buf, len);
+    if (wr < 0) return -1;
+    return (int)wr;
+}
+
+int fileno(FILE* stream) {
+    if (!stream) return -1;
+    if (stream->kind != FILE_KIND_FD) return -1;
+    return stream->fd;
+}
+
+FILE* fdopen(int fd, const char* mode) {
+    (void)mode;
+    if (fd < 0) return NULL;
+    FILE* f = (FILE*)calloc(1, sizeof(FILE));
+    if (!f) return NULL;
+    f->kind = FILE_KIND_FD;
+    f->fd = fd;
+    return f;
+}
+
+FILE* setmntent(const char* filename, const char* type) {
+    if (!filename || !type) return NULL;
+    return fopen(filename, type);
+}
+
+struct mntent* getmntent(FILE* stream) {
+    static struct mntent ent;
+    static char* line;
+    static size_t cap;
+
+    if (!stream) return NULL;
+
+    for (;;) {
+        ssize_t n = getline(&line, &cap, stream);
+        if (n < 0) return NULL;
+        if (n == 0) continue;
+        if (line[0] == '#') continue;
+
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '\n') continue;
+
+        ent.mnt_fsname = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+        if (!*p) continue;
+        *p++ = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+
+        ent.mnt_dir = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+        if (!*p) continue;
+        *p++ = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+
+        ent.mnt_type = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+        if (!*p) continue;
+        *p++ = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+
+        ent.mnt_opts = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+        if (*p) *p++ = '\0';
+
+        ent.mnt_freq = 0;
+        ent.mnt_passno = 0;
+        return &ent;
+    }
+}
+
+int endmntent(FILE* stream) {
+    if (!stream) return 1;
+    return fclose(stream);
 }
 
 /*

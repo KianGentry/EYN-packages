@@ -146,6 +146,7 @@ enum {
     EYN_SYSCALL_CHDIR = 95,
     EYN_SYSCALL_RUN = 96,
     EYN_SYSCALL_WRITE_EDITOR = 97,
+    EYN_SYSCALL_EXECVE = 97,
     EYN_SYSCALL_MMAP = 98,
     EYN_SYSCALL_MUNMAP = 99,
     EYN_SYSCALL_MSYNC = 100,
@@ -270,6 +271,16 @@ enum {
     EYN_SYSCALL_WAITPID = 132,
     // Spawn with explicit stdio/inherit snapshot: args (spawn_ex_req_t* req)
     EYN_SYSCALL_SPAWN_EX = 150,
+    // Send a signal to a PID: args (int pid, int sig)
+    EYN_SYSCALL_KILL = 200,
+    // Restore user signal frame (no args)
+    EYN_SYSCALL_SIGRETURN = 201,
+    // Install a signal handler: args (int sig, void* handler)
+    EYN_SYSCALL_SIGNAL = 202,
+
+    /* New POSIX-oriented syscall numbers */
+    EYN_SYSCALL_FORK = 211,
+    EYN_SYSCALL_VFORK = 212,
 
     // Installer disk management syscalls
     EYN_SYSCALL_INSTALLER_PREPARE_DRIVE = 133,

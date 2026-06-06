@@ -1,2 +1,5 @@
 /www/releases/*
 /tmp_user/
+/packages/nano/
+/packages/tinycc/
+/packages/toybox/

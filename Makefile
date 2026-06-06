@@ -1,15 +1,15 @@
 .PHONY: userland
 
 OUT_DIR ?= ../testdir/binaries
-BUILD_SCRIPT := ./devtools/build_user_c.sh
+BUILD_SCRIPT := ./devtools/build_package.sh
 PACKAGES_DIR := ./packages
 CONFIG_GUI_ENABLED ?= 1
 TTY_EXCLUDES ?=
 
 userland:
 	@mkdir -p "$(OUT_DIR)"
-	@for src in $$(find "$(PACKAGES_DIR)" -mindepth 2 -maxdepth 2 -type f -name '*_uelf.c' | sort); do \
-		name=$$(basename "$$src" _uelf.c); \
+	@for pkg_dir in $$(find "$(PACKAGES_DIR)" -mindepth 1 -maxdepth 1 -type d | sort); do \
+		name=$$(basename "$$pkg_dir"); \
 		out="$(OUT_DIR)/$$name"; \
 		if [ "$(CONFIG_GUI_ENABLED)" = "0" ]; then \
 			skip=0; \
@@ -25,5 +25,5 @@ userland:
 			fi; \
 		fi; \
 		echo "Building $$name ..."; \
-		bash "$(BUILD_SCRIPT)" "$$src" "$$out" || true; \
+		bash "$(BUILD_SCRIPT)" "$$pkg_dir" "$$out" || true; \
 	done

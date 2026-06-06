@@ -23,6 +23,7 @@
  * have no kernel involvement.
  */
 typedef unsigned int jmp_buf[6];
+typedef jmp_buf sigjmp_buf;
 
 /*
  * setjmp() saves the current register context into buf.
@@ -30,6 +31,7 @@ typedef unsigned int jmp_buf[6];
  * jumped to via longjmp().
  */
 int setjmp(jmp_buf buf);
+int sigsetjmp(sigjmp_buf buf, int savesigs);
 
 /*
  * longjmp() restores the context saved by setjmp() and causes setjmp() to
@@ -37,3 +39,4 @@ int setjmp(jmp_buf buf);
  * This function does not return.
  */
 void longjmp(jmp_buf buf, int val) __attribute__((noreturn));
+void siglongjmp(sigjmp_buf buf, int val) __attribute__((noreturn));

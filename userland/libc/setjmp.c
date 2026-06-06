@@ -64,3 +64,12 @@ void longjmp(jmp_buf buf __attribute__((unused)), int val __attribute__((unused)
         "ret\n"
     );
 }
+
+int sigsetjmp(sigjmp_buf buf, int savesigs) {
+    (void)savesigs;
+    return setjmp(buf);
+}
+
+void siglongjmp(sigjmp_buf buf, int val) {
+    longjmp(buf, val);
+}

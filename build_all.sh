@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-BUILD_SCRIPT="./devtools/build_user_c.sh"
+BUILD_SCRIPT="./devtools/build_package.sh"
 PACKAGES_DIR="./packages"
 WWW_DIR="./www"
 RELEASES_DIR="${WWW_DIR}/releases"
@@ -267,11 +267,13 @@ done < <(load_previous_versions "$INDEX_FILE")
 
 for pkg_dir in "$PACKAGES_DIR"/*/; do
     pkgname="$(basename "$pkg_dir")"
-    src="${pkg_dir}${pkgname}_uelf.c"
     prebuilt_bin="${pkg_dir}${pkgname}"
+    latest_source_file=""
     pkg_system="$(read_package_system_flag "$pkg_dir")"
     pkg_prebuilt="$(read_package_prebuilt_flag "$pkg_dir")"
     pkg_version_override="$(read_package_version_override "$pkg_dir")"
+
+    latest_source_file="$(find "$pkg_dir" -type f -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2- || true)"
 
     prev_version="${previous_versions[$pkgname]:-0}"
     prev_version="$(parse_version_literal "$prev_version")"
@@ -336,16 +338,11 @@ for pkg_dir in "$PACKAGES_DIR"/*/; do
         continue
     fi
 
-    if [ ! -f "$src" ]; then
-        echo "warning: no source found for ${pkgname}, skipping"
-        continue
-    fi
-
     if [ "$prev_version" -gt 0 ]; then
         selected_version="$prev_version"
         selected_tarball="${pkgname}-${selected_version}-i386.tar.gz"
         if [ -f "${RELEASES_DIR}/${selected_tarball}" ] \
-            && [ "${RELEASES_DIR}/${selected_tarball}" -nt "$src" ] \
+            && { [ -z "$latest_source_file" ] || [ "${RELEASES_DIR}/${selected_tarball}" -nt "$latest_source_file" ]; } \
             && tarball_has_payload "${RELEASES_DIR}/${selected_tarball}" "${pkgname}"; then
             echo "  skipping ${pkgname} (unchanged @ v${selected_version})"
             sha="$(sha256sum "${RELEASES_DIR}/${selected_tarball}" | awk '{print $1}')"
@@ -371,10 +368,10 @@ for pkg_dir in "$PACKAGES_DIR"/*/; do
     rm -rf "$staging"
     mkdir -p "$staging"
 
-    abs_src="$(realpath "$src")"
+    abs_pkg_dir="$(realpath "$pkg_dir")"
     abs_out="$(realpath "$staging")/${pkgname}"
 
-    if ! EYN_PKG_NAME="$pkgname" EYN_PKG_VERSION_INT="$selected_version" bash "$BUILD_SCRIPT" "$abs_src" "$abs_out"; then
+    if ! EYN_PKG_NAME="$pkgname" EYN_PKG_VERSION_INT="$selected_version" bash "$BUILD_SCRIPT" "$abs_pkg_dir" "$abs_out"; then
         echo "error: build failed for ${pkgname}, skipping"
         rm -rf "$staging"
         continue

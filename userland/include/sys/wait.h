@@ -1,8 +1,8 @@
 #pragma once
 
-// Minimal wait() stub.
+#define WEXITSTATUS(status) (((status) >> 8) & 0xff)
+#define WTERMSIG(status)    ((status) & 0x7f)
+#define WIFEXITED(status)   (WTERMSIG(status) == 0)
 
-static inline int wait(int* status) {
-    (void)status;
-    return -1;
-}
+int wait(int* status);
+int waitpid(int pid, int* status, int options);
