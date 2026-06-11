@@ -318,6 +318,11 @@ enum {
     EYN_SYSCALL_PTY_OPEN = 149,
     // retrieve basic system info: args (eyn_sysinfo_t* out) -> 0 or -1
     EYN_SYSCALL_GET_SYSINFO = 152,
+    // Persisted system config control
+    EYN_SYSCALL_SYSTEMCFG_SET_INSTALL_DRIVE = 153,
+    EYN_SYSCALL_SYSTEMCFG_SET_DRIVE_LABEL = 154,
+    EYN_SYSCALL_SYSTEMCFG_GET_DRIVE_LABEL = 155,
+    EYN_SYSCALL_SYSTEMCFG_GET_INSTALL_DRIVE = 156,
 };
 
 #define EYN_TTY_MODE_RAW 0x0001
@@ -913,6 +918,28 @@ static inline int eyn_sys_spawn_ex(const eyn_spawn_ex_req_t* req) {
 
 static inline int eyn_sys_get_sysinfo(eyn_sysinfo_t* out) {
     return eyn_syscall1(EYN_SYSCALL_GET_SYSINFO, (int)(uintptr_t)out);
+}
+
+static inline int eyn_sys_systemcfg_set_install_drive(uint32_t logical_drive) {
+    return eyn_syscall1(EYN_SYSCALL_SYSTEMCFG_SET_INSTALL_DRIVE, (int)logical_drive);
+}
+
+static inline int eyn_sys_systemcfg_get_install_drive(void) {
+    return eyn_syscall0(EYN_SYSCALL_SYSTEMCFG_GET_INSTALL_DRIVE);
+}
+
+static inline int eyn_sys_systemcfg_set_drive_label(uint32_t logical_drive, const char* label) {
+    return eyn_syscall3(EYN_SYSCALL_SYSTEMCFG_SET_DRIVE_LABEL,
+                        (int)logical_drive,
+                        label,
+                        0);
+}
+
+static inline int eyn_sys_systemcfg_get_drive_label(uint32_t logical_drive, char* out, int out_cap) {
+    return eyn_syscall3(EYN_SYSCALL_SYSTEMCFG_GET_DRIVE_LABEL,
+                        (int)logical_drive,
+                        out,
+                        out_cap);
 }
 
 static inline int eyn_sys_chdir(const char* path) {
