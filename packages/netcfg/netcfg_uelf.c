@@ -129,7 +129,7 @@ static int load_cfg_from_path(const char* path, eyn_net_config_t* cfg) {
 
 int main(int argc, char** argv) {
     if (argc >= 2 && argv[1] && strcmp(argv[1], "-h") == 0) {
-        puts("Usage: netcfg show | netcfg verify | netcfg route <dst_ip> | netcfg defaults [--save] | netcfg set ip|gw|mask|dns <a.b.c.d> [--save] | netcfg save [path] | netcfg load [path]");
+        puts("Usage: netcfg show | netcfg verify | netcfg route <dst_ip> | netcfg defaults [--save] | netcfg set ip|gw|mask|dns <a.b.c.d> [--save] | netcfg dhcp [--save] | netcfg save [path] | netcfg load [path]");
         return 0;
     }
 
@@ -237,6 +237,37 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (strcmp(sub, "dhcp") == 0) {
+        int rc = eyn_sys_net_dhcp_request(0, 0, 0);
+        if (rc != 0) {
+            printf("netcfg dhcp: failed (%d)\n", rc);
+            return 1;
+        }
+
+        if (eyn_sys_netcfg_get(&cfg) != 0) {
+            puts("netcfg dhcp: lease acquired but failed to read config");
+            return 1;
+        }
+
+        printf("netcfg dhcp:\n");
+        printf("  ip=%u.%u.%u.%u\n", (unsigned)cfg.local_ip[0], (unsigned)cfg.local_ip[1], (unsigned)cfg.local_ip[2], (unsigned)cfg.local_ip[3]);
+        printf("  gw=%u.%u.%u.%u\n", (unsigned)cfg.gateway_ip[0], (unsigned)cfg.gateway_ip[1], (unsigned)cfg.gateway_ip[2], (unsigned)cfg.gateway_ip[3]);
+        printf("  mask=%u.%u.%u.%u\n", (unsigned)cfg.netmask[0], (unsigned)cfg.netmask[1], (unsigned)cfg.netmask[2], (unsigned)cfg.netmask[3]);
+        printf("  dns=%u.%u.%u.%u\n", (unsigned)cfg.dns_ip[0], (unsigned)cfg.dns_ip[1], (unsigned)cfg.dns_ip[2], (unsigned)cfg.dns_ip[3]);
+
+        if (argc >= 3 && argv[2] && strcmp(argv[2], "--save") == 0) {
+            if (save_cfg_to_path("/config/net.cfg", &cfg) != 0) {
+                puts("netcfg dhcp: lease acquired, save failed");
+                return 1;
+            }
+            puts("netcfg dhcp: lease acquired and saved to /config/net.cfg");
+            return 0;
+        }
+
+        puts("netcfg dhcp: lease acquired");
+        return 0;
+    }
+
     if (strcmp(sub, "save") == 0) {
         const char* path = (argc >= 3 && argv[2] && argv[2][0]) ? argv[2] : "/config/net.cfg";
         if (save_cfg_to_path(path, &cfg) != 0) {
@@ -261,7 +292,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    puts("Usage: netcfg show | netcfg verify | netcfg route <dst_ip> | netcfg defaults [--save] | netcfg set ip|gw|mask|dns <a.b.c.d> [--save] | netcfg save [path] | netcfg load [path]");
+    puts("Usage: netcfg show | netcfg verify | netcfg route <dst_ip> | netcfg defaults [--save] | netcfg set ip|gw|mask|dns <a.b.c.d> [--save] | netcfg dhcp [--save] | netcfg save [path] | netcfg load [path]");
         return 1;
 
     return 0;
