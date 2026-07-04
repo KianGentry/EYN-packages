@@ -1423,10 +1423,6 @@ int res_mkquery(int op, const char* dname, int class, int type, const unsigned c
     return 0;
 }
 
-struct in_addr {
-    uint32_t s_addr;
-};
-
 char* inet_ntoa(struct in_addr in) {
     static char out[16];
     unsigned int a = (in.s_addr >> 24) & 0xffu;

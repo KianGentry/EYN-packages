@@ -264,6 +264,6 @@ fi
 # --start-group/--end-group ensures cross-object references within the
 # archive resolve regardless of insertion order (needed for x11.c → gui.c).
 mkdir -p "$(dirname "$out")"
-"$CC" -m32 -nostdlib -nostartfiles -Wl,-m,elf_i386 -Wl,-nostdlib -Wl,-e,_start -Wl,-T,"$ldscript" -o "$out" "$obj_crt" "$obj_app" "$obj_pkgmeta" "${extra_objs[@]}" -Wl,--start-group "$lib_archive" -lgcc -Wl,--end-group
+"$CC" -m32 -nostdlib -no-pie -nostartfiles -Wl,-m,elf_i386 -Wl,-nostdlib -Wl,-e,_start -Wl,-T,"$ldscript" -o "$out" "$obj_crt" "$obj_app" "$obj_pkgmeta" "${extra_objs[@]}" -Wl,--start-group "$lib_archive" -lgcc -Wl,--end-group
 
 echo "Built $out"
