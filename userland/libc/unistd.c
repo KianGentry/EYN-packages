@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/uio.h>
+#include <sys/time.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
@@ -166,6 +167,46 @@ ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
     return total;
 }
 
+/*
+ * TCP pool-socket fd tracking.
+ *
+ * The kernel exposes a small pool of NET_TCP_MAX_SOCKETS-1 (7) TCP "pool
+ * sockets" (ids 1..7, syscalls 161-170), shared system-wide rather than
+ * per-process. socket() hands one of these ids back directly as the
+ * sockfd; this table just remembers which ids *this* process currently
+ * owns, so close(fd) can tell a socket fd apart from a regular file/pipe
+ * fd and route it to the socket teardown syscall instead of the generic
+ * one.
+ *
+ * KNOWN LIMITATION: the kernel has no "query a single socket's state by
+ * id" syscall, so recv() cannot distinguish "no data queued yet" from
+ * "peer performed an orderly close" -- both currently read back as 0 from
+ * the underlying syscall. To avoid recv() hanging forever in that case,
+ * recv() below never returns 0; a stalled/closed connection surfaces as
+ * -1/EAGAIN once the receive timeout elapses (see SO_RCVTIMEO handling).
+ * Likewise accept()/recvfrom() cannot reliably report the peer's address
+ * (no way to correlate a fresh socket_id back to its tcp_socket entry
+ * from userland), so their addr/addrlen output is best-effort (zeroed,
+ * family set only).
+ */
+#define EYN_TCP_POOL_MAX 8
+#define EYN_TCP_MAX_PAYLOAD 1536u
+#define EYN_SOCK_DEFAULT_RCVTIMEO_MS 60000u
+
+static uint8_t g_eyn_tcp_socket_open[EYN_TCP_POOL_MAX];
+static uint8_t g_eyn_tcp_rcvtimeo_set[EYN_TCP_POOL_MAX];
+static uint32_t g_eyn_tcp_rcvtimeo_ms[EYN_TCP_POOL_MAX];
+
+static int eyn_tcp_sockfd_valid(int sockfd) {
+    return sockfd > 0 && sockfd < EYN_TCP_POOL_MAX && g_eyn_tcp_socket_open[sockfd];
+}
+
+static void eyn_tcp_sockfd_forget(int sockfd) {
+    g_eyn_tcp_socket_open[sockfd] = 0;
+    g_eyn_tcp_rcvtimeo_set[sockfd] = 0;
+    g_eyn_tcp_rcvtimeo_ms[sockfd] = 0;
+}
+
 int close(int fd) {
     if (eyn_vfork_child_active()) {
         if (fd <= 2) {
@@ -174,6 +215,10 @@ int close(int fd) {
         }
         g_vfork_compat.child_inherit_mode = 0;
         return 0;
+    }
+    if (fd > 0 && fd < EYN_TCP_POOL_MAX && g_eyn_tcp_socket_open[fd]) {
+        eyn_tcp_sockfd_forget(fd);
+        return eyn_sys_net_tcp_socket_close(fd);
     }
     return eyn_syscall1(EYN_SYSCALL_CLOSE, fd);
 }
@@ -887,11 +932,29 @@ int uname(struct utsname* buf) {
 }
 
 int socket(int domain, int type, int protocol) {
-    (void)domain;
-    (void)type;
-    (void)protocol;
-    errno = ENOSYS;
-    return -1;
+    if (domain != AF_INET) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+    if (type != SOCK_STREAM) {
+        /* Only TCP pool sockets are backed by a kernel implementation. */
+        errno = EPROTONOSUPPORT;
+        return -1;
+    }
+    if (protocol != 0 && protocol != IPPROTO_TCP) {
+        errno = EPROTONOSUPPORT;
+        return -1;
+    }
+
+    int id = eyn_sys_net_tcp_socket_open();
+    if (id <= 0 || id >= EYN_TCP_POOL_MAX) {
+        errno = EMFILE;
+        return -1;
+    }
+
+    eyn_tcp_sockfd_forget(id);
+    g_eyn_tcp_socket_open[id] = 1;
+    return id;
 }
 
 int mlock(const void* addr, size_t len) {
@@ -912,52 +975,148 @@ int mlockall(int flags) {
 }
 
 int bind(int sockfd, const struct sockaddr* addr, socklen_t addrlen) {
-    (void)sockfd;
-    (void)addr;
-    (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!eyn_tcp_sockfd_valid(sockfd)) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+    if (!addr || addrlen < (socklen_t)sizeof(struct sockaddr_in)) {
+        errno = EINVAL;
+        return -1;
+    }
+    const struct sockaddr_in* sin = (const struct sockaddr_in*)(const void*)addr;
+    if (sin->sin_family != AF_INET) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+
+    int rc = eyn_sys_net_tcp_socket_bind(sockfd, ntohs(sin->sin_port));
+    if (rc != 0) {
+        errno = (rc == -3) ? EADDRINUSE : EINVAL;
+        return -1;
+    }
+    return 0;
 }
 
 int connect(int sockfd, const struct sockaddr* addr, socklen_t addrlen) {
-    (void)sockfd;
-    (void)addr;
-    (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!eyn_tcp_sockfd_valid(sockfd)) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+    if (!addr || addrlen < (socklen_t)sizeof(struct sockaddr_in)) {
+        errno = EINVAL;
+        return -1;
+    }
+    const struct sockaddr_in* sin = (const struct sockaddr_in*)(const void*)addr;
+    if (sin->sin_family != AF_INET) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+
+    uint8_t dst_ip[4];
+    memcpy(dst_ip, &sin->sin_addr.s_addr, 4);
+
+    int rc = eyn_sys_net_tcp_socket_connect(sockfd, ntohs(sin->sin_port), dst_ip);
+    if (rc != 0) {
+        errno = ECONNREFUSED;
+        return -1;
+    }
+    return 0;
 }
 
 int listen(int sockfd, int backlog) {
-    (void)sockfd;
-    (void)backlog;
-    errno = ENOSYS;
-    return -1;
+    if (!eyn_tcp_sockfd_valid(sockfd)) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+    if (eyn_sys_net_tcp_socket_listen(sockfd, backlog) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
 }
 
 int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
-    (void)sockfd;
-    (void)addr;
-    (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    if (!eyn_tcp_sockfd_valid(sockfd)) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+
+    /* timeout_spins==0 selects the kernel's own default (~2M poll spins),
+       matching the blocking behavior already used by the legacy connect
+       API elsewhere in this codebase. */
+    int new_id = eyn_sys_net_tcp_socket_accept(sockfd, 0);
+    if (new_id <= 0 || new_id >= EYN_TCP_POOL_MAX) {
+        errno = (new_id == -3) ? ETIMEDOUT : ECONNABORTED;
+        return -1;
+    }
+
+    eyn_tcp_sockfd_forget(new_id);
+    g_eyn_tcp_socket_open[new_id] = 1;
+
+    if (addr && addrlen && *addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        /* Best-effort only: see KNOWN LIMITATION comment above close(). */
+        struct sockaddr_in* sin = (struct sockaddr_in*)(void*)addr;
+        memset(sin, 0, sizeof(*sin));
+        sin->sin_family = AF_INET;
+        *addrlen = (socklen_t)sizeof(struct sockaddr_in);
+    }
+
+    return new_id;
 }
 
 ssize_t send(int sockfd, const void* buf, size_t len, int flags) {
-    (void)sockfd;
-    (void)buf;
-    (void)len;
     (void)flags;
-    errno = ENOSYS;
-    return -1;
+    if (!eyn_tcp_sockfd_valid(sockfd)) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+    if (!buf) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (len > EYN_TCP_MAX_PAYLOAD) len = EYN_TCP_MAX_PAYLOAD;
+
+    int rc = eyn_sys_net_tcp_socket_send(sockfd, buf, (uint32_t)len);
+    if (rc < 0) {
+        errno = (rc == -3) ? ENOTCONN : ECONNRESET;
+        return -1;
+    }
+    return (ssize_t)rc;
 }
 
 ssize_t recv(int sockfd, void* buf, size_t len, int flags) {
-    (void)sockfd;
-    (void)buf;
-    (void)len;
     (void)flags;
-    errno = ENOSYS;
-    return -1;
+    if (!eyn_tcp_sockfd_valid(sockfd)) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+    if (!buf) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (len > EYN_TCP_MAX_PAYLOAD) len = EYN_TCP_MAX_PAYLOAD;
+
+    int block_forever = g_eyn_tcp_rcvtimeo_set[sockfd] && g_eyn_tcp_rcvtimeo_ms[sockfd] == 0;
+    uint32_t timeout_ms = g_eyn_tcp_rcvtimeo_set[sockfd] ? g_eyn_tcp_rcvtimeo_ms[sockfd] : EYN_SOCK_DEFAULT_RCVTIMEO_MS;
+    uint32_t waited_ms = 0;
+
+    for (;;) {
+        int rc = eyn_sys_net_tcp_socket_recv(sockfd, buf, (uint32_t)len);
+        if (rc > 0) return (ssize_t)rc;
+        if (rc < 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+
+        /* rc == 0: nothing queued right now (see KNOWN LIMITATION comment
+           above close() -- this cannot be told apart from a peer close). */
+        if (!block_forever && waited_ms >= timeout_ms) {
+            errno = EAGAIN;
+            return -1;
+        }
+        usleep(10000);
+        waited_ms += 10;
+    }
 }
 
 ssize_t sendmsg(int sockfd, const struct msghdr* msg, int flags) {
@@ -977,35 +1136,53 @@ ssize_t recvmsg(int sockfd, struct msghdr* msg, int flags) {
 }
 
 ssize_t sendto(int sockfd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr, socklen_t addrlen) {
-    (void)sockfd;
-    (void)buf;
-    (void)len;
-    (void)flags;
+    /* No kernel UDP socket support exists; only already-connected TCP pool
+       sockets are backed here. Per POSIX this is legal: sendto() on a
+       connection-mode socket ignores dest_addr/addrlen. */
     (void)dest_addr;
     (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    return send(sockfd, buf, len, flags);
 }
 
 ssize_t recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t* addrlen) {
-    (void)sockfd;
-    (void)buf;
-    (void)len;
-    (void)flags;
-    (void)src_addr;
-    (void)addrlen;
-    errno = ENOSYS;
-    return -1;
+    ssize_t rc = recv(sockfd, buf, len, flags);
+    if (rc >= 0 && src_addr && addrlen && *addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        /* Best-effort only: see KNOWN LIMITATION comment above close(). */
+        struct sockaddr_in* sin = (struct sockaddr_in*)(void*)src_addr;
+        memset(sin, 0, sizeof(*sin));
+        sin->sin_family = AF_INET;
+        *addrlen = (socklen_t)sizeof(struct sockaddr_in);
+    }
+    return rc;
 }
 
 int setsockopt(int sockfd, int level, int optname, const void* optval, socklen_t optlen) {
-    (void)sockfd;
+    if (!eyn_tcp_sockfd_valid(sockfd)) {
+        errno = ENOTSOCK;
+        return -1;
+    }
+
+    if (level == SOL_SOCKET && optname == SO_RCVTIMEO) {
+        if (!optval || optlen < (socklen_t)sizeof(struct timeval)) {
+            errno = EINVAL;
+            return -1;
+        }
+        const struct timeval* tv = (const struct timeval*)optval;
+        uint32_t ms = (uint32_t)(tv->tv_sec * 1000L + tv->tv_usec / 1000L);
+        g_eyn_tcp_rcvtimeo_set[sockfd] = 1;
+        g_eyn_tcp_rcvtimeo_ms[sockfd] = ms;
+        return 0;
+    }
+
+    /* Other options (SO_REUSEADDR, SO_SNDTIMEO, ...) are accepted but have
+       no effect: this stack has no listen-address reuse and send() never
+       blocks. Silently succeed so callers that set them defensively don't
+       fail outright. */
     (void)level;
     (void)optname;
     (void)optval;
     (void)optlen;
-    errno = ENOSYS;
-    return -1;
+    return 0;
 }
 
 int getsockopt(int sockfd, int level, int optname, void* optval, socklen_t* optlen) {
