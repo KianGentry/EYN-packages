@@ -210,6 +210,9 @@ build_from_source_list() {
   if [ -d "$pkg_dir/generated" ]; then
     pkg_cflags+=( -I"$pkg_dir/generated" )
   fi
+  if [ -d "$repo_root/shared" ]; then
+    pkg_cflags+=( -I"$repo_root/shared" )
+  fi
 
   local objs=()
   local idx=0

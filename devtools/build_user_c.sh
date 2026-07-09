@@ -148,6 +148,10 @@ fi
 if [ -d "$pkg_src_dir" ]; then
   CFLAGS+=( -I"$pkg_src_dir" )
 fi
+if [ -d "$repo_root/shared" ]; then
+  CFLAGS+=( -I"$repo_root/shared" )
+fi
+
 
 scan_sources=( "$src" )
 if [ -d "$pkg_src_dir" ]; then
@@ -159,7 +163,6 @@ fi
 if [ -d "$shared_mbedtls_dir" ]; then
   if grep -E -q '["<]mbedtls/' "${scan_sources[@]}"; then
     use_shared_mbedtls=1
-    CFLAGS+=( -I"$repo_root/shared" )
   fi
 fi
 
